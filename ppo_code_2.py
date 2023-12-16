@@ -1,10 +1,20 @@
 import numpy as np
-import tensorflow as tf
-import tensorflow_probability as tfp
-import keras
-from keras.layers import Input, Dense, Concatenate
-from keras.optimizers import Adam
+import torch as T
+import torch.nn as nn
+import torch.optim as optim
 import gymnasium as gym
+import torch.distributions as dist
+import torch.nn.functional as F
+from torch import cuda
+from torch.backends import mps
+
+def _get_torch_device() -> str:
+    if cuda.is_available():
+        return "cuda"
+    elif mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
 
 class AgentMemory:
     def __init__(self, *timeline_keys):
@@ -39,31 +49,56 @@ class AgentMemory:
             return np.random.permutation(self._timeline[key])
         return self._timeline[key]
     
-class Network:
-    def __init__(self, input_dims, output_dim, output_activations=(None,), hidden_dims=(64, 32), hidden_activations="relu", learning_rate=0.01, loss_function=lambda *_: None):
-        self._input_dims = input_dims
+
+class Network(nn.Module):
+    def __init__(self, input_dim, output_dim, output_activations=tuple(), hidden_dims=(64, 32), hidden_activations=None, learning_rate=0.01):
+        super(Network, self).__init__()
+
+        self._input_dim = input_dim
         self._hidden_dims = hidden_dims
-        self._hidden_activations = [hidden_activations for _ in hidden_dims] if isinstance(hidden_activations, str) else hidden_activations
         self._output_dim = output_dim
-        self._output_activations = output_activations
-        self._learning_rate = learning_rate
-        self._loss_function = loss_function
+
+        hidden_activations = [nn.ReLU() for _ in hidden_dims] if hidden_activations is None else hidden_activations
+
+        # Hidden Layer
+        layers = []
+        prev_dim = input_dim
+        for dim, activation in zip(hidden_dims, hidden_activations):
+            layers.append(nn.Linear(prev_dim, dim))
+            layers.append(activation)
+            prev_dim = dim
+        self._hidden_layers = nn.Sequential(*layers)
+
+        # Define output layers
+        self._output_layers = nn.ModuleList()
+        if output_activations:
+            for activation in output_activations:
+                self._output_layers.append(
+                    nn.Sequential(
+                        nn.Linear(prev_dim, output_dim),
+                        activation,
+                        )
+                )
+        else:           
+            self._output_layers.append(nn.Linear(prev_dim, 1))
+        self._optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+
+    def forward(self, x):
+        x = self._hidden_layers(x)
+        outputs = list(output_layer(x) for output_layer in self._output_layers)
+        if len(outputs) == 1:
+            return outputs[0]
+        return outputs
     
-    @property
-    def build(self):
-        input_layer = list(Input(shape=dim) for dim in self._input_dims)
+    def train_step(self, loss_function, *inputs):
+        self.train()
+        self._optimizer.zero_grad()
+        loss = loss_function(*inputs)
+        loss.backward()
+        self._optimizer.step()
+        return loss.item()
 
-        layer = input_layer[0]
-        for dim, activation in zip(self._hidden_dims, self._hidden_activations):
-            layer = Dense(dim, activation=activation)(layer)
-        
-        output_layer = Concatenate()(list(Dense(self._output_dim, activation=activation)(layer) for activation in self._output_activations))
-
-        model = keras.Model(inputs=input_layer, outputs=output_layer)
-        model.compile(optimizer=Adam(learning_rate=self._learning_rate), loss=self._loss_function(*input_layer[1:])) #?
-        model.summary()
-        return model
-
+    
 class Agent:
     def __init__(self, env, continuity=True, optimal=False, gamma=0.9, lambda_gae=0.95, 
                  value_ratio_loss=0.001, entropy_loss_ratio=0.001,
@@ -109,50 +144,16 @@ class Agent:
         self._input_dim = self._observation_space.shape[0]
         self._output_dim = self._action_space.shape[0] if continuity else self._action_space.n
 
-        activations = ("tanh", "softplus") if continuity else ("softmax",)
-        input_dims = (self._input_dim, 1, 1, 1, self._output_dim, self._output_dim) if continuity else (self._input_dim,)
+        activations = (nn.Tanh(), nn.Softplus()) if continuity else (nn.Softmax(dim=-1),)
 
-        self._actor_network = Network(input_dims, self._output_dim, activations, learning_rate=learning_rates[0], loss_function=self._loss_function).build
-        self._old_actor_network = Network(input_dims, self._output_dim, activations, learning_rate=learning_rates[0], loss_function=self._loss_function).build
-        self._critic_network = Network((self._input_dim,), 1, learning_rate=learning_rates[1], loss_function=lambda *_: "mean_squared_error").build
+        self._device = T.device(_get_torch_device())
 
-        self._empty_filler = lambda tensor: list(np.empty((len(tensor), dim)) for dim in input_dims[1:])
-    
-    def _loss_function(self, advantage, value, reward_return, old_log_probabilities, current_log_probabilities):
-        def loss():
-            # Surrogate losses 
-            # L_t^CLIP+VF+S = E_t[L_t^CLIP(Theta) - c_1 L_t^VF(Theta) + c_2 S[pi_Theta](s_t)]
+        self._actor_network = Network(self._input_dim, self._output_dim, activations, learning_rate=learning_rates[0]).to(self._device)
+        self._old_actor_network = Network(self._input_dim, self._output_dim, activations, learning_rate=learning_rates[0]).to(self._device)
+        self._critic_network = Network(self._input_dim, 1, learning_rate=learning_rates[1]).to(self._device)
 
-            # Probability Ratio: r_t(Theta) = pi_Theta(a|s) / pi_Theta_k(a|s) = e^(pi_Theta(a|s) - pi_Theta_k(a|s))
-            ratio = keras.backend.exp(current_log_probabilities - old_log_probabilities)
+        print(self._actor_network, self._critic_network)
 
-            # Importance Sampling Ratio: r_t(Theta) * A_t
-            weighted_probabilities = ratio * advantage
-
-            # Simplified Clipping g(epsilon, A_t) = ((1 + epsilon) if A_t >= 0 else if A_t < 0 (1 - epsilon)) * A_t
-            clipped_probabilities = 1 - self._policy_clip if advantage < 0 else 1 + self._policy_clip
-            weighted_clipped_probabilities = clipped_probabilities * advantage
-
-            # L_t^CLIP(Theta) = E_t[min(r_t(Theta)A_t, g(epsilon, A_t)]
-            # Negative indicating loss
-            actor_loss = - keras.backend.mean(keras.backend.minimum(weighted_probabilities, weighted_clipped_probabilities))
-            
-            # c_1 L_t^VF(Theta) = c_1 MSE = c_1 (V_Theta(s_t) - V_t^target)^2
-            # Negative sign is not used since MSE is being used
-            critic_loss = self._value_loss_ratio * keras.losses.MSE(value, reward_return)
-
-            # c_2 S[pi_Theta](s_t) = c_2 Entropy Bonus
-            if self._continuity:
-                sigma = current_log_probabilities[:, self._output_dim:]
-                variance = keras.backend.square(sigma)
-                entropy_loss = -self._entropy_loss_ratio * keras.backend.mean((keras.backend.log(2 * np.pi * variance) + 1) / 2)  
-            else:
-                probabilities = keras.backend.softmax(current_log_probabilities)  
-                entropy_loss = -self._entropy_loss_ratio * keras.backend.mean(keras.backend.sum(probabilities * keras.backend.log(probabilities + keras.backend.epsilon()), axis=-1))
-            
-            return actor_loss + critic_loss + entropy_loss
-        return loss
-        
     def train_run(self):
         # Train Cycles
         for iteration in range(self._training_iterations):
@@ -170,11 +171,11 @@ class Agent:
                 while not terminal:
 
                     # Environment Interaction
-                    action, log_probability = self._get_action(current_state)
+                    output, action, log_probability = self._get_action(current_state)
                     new_state, reward, terminal_state, truncated, _  = self._env.step(action)
                     total_reward += reward
                     terminal = terminal_state or truncated
-                    trajectory.append((current_state, action, log_probability, terminal, reward, new_state))
+                    trajectory.append((output, current_state, action, log_probability, terminal, reward, new_state))
                     current_state = new_state
                 
                 # Memorize
@@ -186,8 +187,11 @@ class Agent:
 
                 # Get Critic Values
                 states = self._memory.get_rollouts("current_state", [batch_section])
-                states = tf.convert_to_tensor(states)
-                values = self._critic_network.predict(states).flatten()
+                states = T.from_numpy(states).float().to(self._device)
+                with T.no_grad():
+                    values = self._critic_network(states)
+                values = values.flatten()
+                values = values.cpu().numpy() if values.is_cuda else values.numpy()
 
                 # Compute Advantage and Return
                 advantage_returns = self._advantages_returns_calculation(rewards, values, last_reward)
@@ -201,35 +205,35 @@ class Agent:
             # Forget
             self._memory.new_memory()
             
-            if iteration % 10 == 0:
+            if iteration % 1 == 0:
                 print(f"Iteration:{iteration}, total_reward:{total_reward}")
-
-    
 
     def _get_action(self, state):
         # Convert to Tensor
-        state = tf.convert_to_tensor([state])
+        state_tensor = T.from_numpy(np.array([state])).float().to(self._device)
 
         # Network Prediction of Action Probabilities pi_Theta_k(a_t|s_t)
-        action_probabilities = self._actor_network.predict_on_batch([state, *self._empty_filler(state)])
+        with T.no_grad():
+            action_probabilities = self._actor_network(state_tensor)
 
         if self._optimal:
-
-            # Optimal action is of max probability (mu for continous space)
-            action = action_probabilities[0, 0:self._output_dim] if self._continuity else tf.math.argmax(action_probabilities)
-            log_probability = np.ones_like(action)
+            # Optimal action is of max probability (mu for continuous space)
+            action = action_probabilities[0] if self._continuity else T.argmax(action_probabilities[0], dim=1)
+            log_probability = T.constant([1.], dtype=T.float32)
         else:
-
-            # Action based on probability distribution (mu and sigma used in continous space)
-            distribution = tfp.distributions.Normal(action_probabilities[0, 0:self._output_dim], action_probabilities[0, self._output_dim:]) if self._continuity else tfp.distributions.Categorical(action_probabilities) 
+            # Action based on probability distribution (mu and sigma used in continuous space)
+            distribution = dist.Normal(action_probabilities[0], action_probabilities[1]) if self._continuity else dist.Categorical(action_probabilities)
             action = distribution.sample()
-            log_probability = distribution.log_prob(action).numpy()
+            log_probability = T.sum(distribution.log_prob(action), dim=-1)
 
         # Numpy Conversion
-        action = action.numpy()
+        action_probabilities = T.stack(action_probabilities)
+        action_probabilities = action_probabilities.cpu().numpy() if action_probabilities.is_cuda else action_probabilities.numpy()
+        action = action.cpu().numpy() if action.is_cuda else action.numpy()
+        log_probability = log_probability.cpu().numpy() if log_probability.is_cuda else log_probability.numpy()
         
-        return action, log_probability
-    
+        return action_probabilities, action[0], log_probability[0]
+
     def _advantages_returns_calculation(self, rewards, values, last_reward):
         # Extend critic value with the last reward
         values = np.append(values, last_reward)
@@ -256,46 +260,93 @@ class Agent:
     def _train_network(self):
         batch_indicies = self._memory.get_rollouts("batch_index", randomize=True)[:self._batch_size]
         batches = self._memory.get_rollouts("batch")[batch_indicies]
-        states = self._memory.get_rollouts("current_state", batches)
-        actions = self._memory.get_rollouts("action", batches)
-        advantages = self._memory.get_rollouts("advantage", batches)
-        returns = self._memory.get_rollouts("return", batches)
-        values = self._memory.get_rollouts("value", batches)
-        log_probability = self._memory.get_rollouts("log_probability", batches)
 
-        advantages = tf.convert_to_tensor(advantages)
-        advantages = tf.squeeze(keras.utils.normalize(advantages))
+        outputs = self._memory.get_rollouts("output", batches)
+        r = np.random.permutation(np.arange(0, len(outputs)))[:256]
+        outputs = outputs[r]
+        states = self._memory.get_rollouts("current_state", batches)[r]
+        actions = self._memory.get_rollouts("action", batches)[r]
+        advantages = self._memory.get_rollouts("advantage", batches)[r]
+        returns = self._memory.get_rollouts("return", batches)[r]
+        values = self._memory.get_rollouts("value", batches)[r]
+        log_probabilities = self._memory.get_rollouts("log_probability", batches)[r]
 
-        old_log_probability = self._old_action_log_probability_density(states, actions)
+        advantages = T.from_numpy(np.array([advantages])).float().to(self._device)
+        # norm = T.norm(advantages_tensor, p=2, dim=1, keepdim=True)
+        # advantages = T.div(norm.expand_as(advantages_tensor))
+        old_log_probabilities = self._old_action_log_probability_density(states, actions)
 
-        self._actor_network.fit(
-            x=[states, advantages, values, returns, old_log_probability, log_probability], verbose=0)
-        self._critic_network.fit(
-            x=states, y=returns, epochs=1, verbose=0)
-        
+        sigmas = T.from_numpy(outputs[1][0]).float().to(self._device)
+        values = T.from_numpy(values).float().to(self._device)
+        returns = T.from_numpy(returns).float().to(self._device)
+        old_log_probabilities = T.from_numpy(old_log_probabilities).float().to(self._device)
+        log_probabilities = T.from_numpy(log_probabilities).float().to(self._device)
+
+        sigmas.requires_grad = True
+        values.requires_grad = True
+        returns.requires_grad = True
+        old_log_probabilities.requires_grad = True
+        log_probabilities.requires_grad = True
+        advantages.requires_grad = True
+
+        critic_loss = self._critic_network.train_step(nn.MSELoss(), values, returns)
+        self._actor_network.train_step(self._loss_function, advantages, old_log_probabilities, log_probabilities, critic_loss, sigmas)
         self._update_networks()
 
     def _old_action_log_probability_density(self, states, actions):
-        states = tf.convert_to_tensor(states)
-        actions = tf.convert_to_tensor(actions)
-        action_probabilities = self._old_actor_network.predict([states, *self._empty_filler(states)])
-        distribution = tfp.distributions.Normal(action_probabilities[0, 0:self._output_dim], action_probabilities[0, self._output_dim:]) if self._continuity else tfp.distributions.Categorical(action_probabilities)
-        return distribution.log_prob(actions).numpy()
+        states = T.from_numpy(states).float().to(self._device)
+        actions = T.from_numpy(actions).float().to(self._device)
+        with T.no_grad():
+            action_probabilities = self._old_actor_network(states)
+        
+        distribution = dist.Normal(action_probabilities[0], action_probabilities[1]) if self._continuity else dist.Categorical(logits=action_probabilities)
+        log_probability = T.sum(distribution.log_prob(actions), dim=-1)
+        return log_probability.cpu().numpy() if log_probability.is_cuda else log_probability.numpy()
+    
+    def _loss_function(self, advantage, old_log_probabilities, current_log_probabilities, critic_loss, sigma):
+        # Probability Ratio: r_t(Theta) = pi_Theta(a|s) / pi_Theta_k(a|s) = e^(pi_Theta(a|s) - pi_Theta_k(a|s))
+        ratio = T.exp(current_log_probabilities - old_log_probabilities)
+
+        # Importance Sampling Ratio: r_t(Theta) * A_t
+        weighted_probabilities = ratio * advantage
+
+        # Simplified Clipping g(epsilon, A_t) = ((1 + epsilon) if A_t >= 0 else if A_t < 0 (1 - epsilon)) * A_t
+        clipped_probabilities = T.clamp(ratio, 1 - self._policy_clip, 1 + self._policy_clip)
+        weighted_clipped_probabilities = clipped_probabilities * advantage
+
+        # L_t^CLIP(Theta) = E_t[min(r_t(Theta)A_t, g(epsilon, A_t)]
+        # Negative indicating loss
+        actor_loss = -T.mean(T.min(weighted_probabilities, weighted_clipped_probabilities))
+
+        # c_1 L_t^VF(Theta) = c_1 MSE = c_1 (V_Theta(s_t) - V_t^target)^2
+        # Negative sign is not used since MSE is being used
+        critic_loss = self._value_loss_ratio * critic_loss
+
+        # c_2 S[pi_Theta](s_t) = c_2 Entropy Bonus
+        if self._continuity:
+            variance = sigma.pow(2)
+            entropy_loss = -self._entropy_loss_ratio * T.mean((T.log(2 * 3.14159 * variance) + 1) / 2)  
+        else:
+            probabilities = F.softmax(current_log_probabilities, dim=-1)  
+            entropy_loss = -self._entropy_loss_ratio * T.mean(T.sum(probabilities * T.log(probabilities + 1e-7), dim=-1))
+        
+        loss = actor_loss + critic_loss
+        loss = loss + entropy_loss
+        return loss
     
     def _update_networks(self):
-        """Softupdate of the target network.
-        In ppo, the updates of the 
-        """
         alpha = self._learning_rates[0]
-        actor_weights = np.array(self._actor_network.get_weights())
-        actor_tartget_weights = np.array(self._old_actor_network.get_weights())
-        new_weights = alpha*actor_weights + (1-alpha)*actor_tartget_weights
-        self._old_actor_network.set_weights(new_weights)
+        
+        # Iterate through the parameters of both networks
+        for target_param, local_param in zip(self._old_actor_network.parameters(), self._actor_network.parameters()):
+            # Soft update: target = alpha * local + (1 - alpha) * target
+            target_param.data.copy_(alpha * local_param.data + (1.0 - alpha) * target_param.data)
 
+    
 training_iterations = 1000
-episodes = 5
-batch_size = int(episodes * 0.9)
-memory_order = ("current_state", "action", "log_probability", "terminal", "reward", "new_state")
+episodes = 1
+batch_size = int(episodes * 1)
+memory_order = ("output", "current_state", "action", "log_probability", "terminal", "reward", "new_state")
 gamma = 0.9
 lambda_gae = 0.95
 value_ratio_loss = 0.001
@@ -327,3 +378,4 @@ agent = Agent(env,
               policy_clip=policy_clip,
               memory_order=memory_order)
 agent.train_run()
+env.close()
