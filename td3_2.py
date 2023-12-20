@@ -105,7 +105,8 @@ class Network(nn.Module):
         return outputs
 
 class Agent():
-    def __init__(self, env, gamma=0.99, beta=0.995, learning_rate=(0.001,), update_epoches=10, theta=0.2, dt=1e-2, sigma=0.2, batch_size=64, memory_size=1000):
+    def __init__(self, env, gamma=0.99, beta=0.995, learning_rate=(0.001,), update_epoches=10, theta=0.2, dt=1e-2, 
+                 sigma=0.2, batch_size=64, memory_size=1000, min_noise_clip=-0.5, max_noise_clip=0.5, noise_scale=0.2, policy_delay=2):
         # Reward Discount
         self._gamma = gamma
         # Weight Discount
@@ -125,15 +126,18 @@ class Agent():
         self._action_dims = env.action_space.shape[0]
         self._min_bounds = env.action_space.low
         self._max_bounds = env.action_space.high
-        
+
         # Ornstein Uhlenbeck noise
         self.noise = Noise(self._action_dims, theta, dt, sigma)
-        self._min_noise_clip = -0.5
-        self._max_noise_clip = 0.5
-        self._noise_scale = 0.2
+        self._min_noise_clip = min_noise_clip
+        self._max_noise_clip = max_noise_clip
+        self._noise_scale = noise_scale
 
         # Activation Functions
         activations = (nn.Tanh(),)
+        
+        # Policy delay
+        self._policy_delay = policy_delay
         
         # Torch device: GPU or CPU
         self._device = T.device(_get_torch_device())
@@ -176,13 +180,14 @@ class Agent():
 
     def _get_target_action(self, next_state):
         # Convert to tensor
-        next_state_tensor = self._get_tensor(np.array([next_state]), False).detach()
-        # Get action from actor
-        target_action = self._actor(next_state_tensor).to(self._device)
+        next_state_tensor = self._get_tensor(next_state, False).detach()
+        with T.no_grad():
+            # Get action from actor
+            target_action = self._actor(next_state_tensor).to(self._device)
         # Add clipped noise to action
         target_action = target_action + T.clamp(T.tensor(np.random.normal(scale=self._noise_scale)), self._min_noise_clip, self._max_noise_clip)
         # Clip actions
-        target_action = T.clamp(target_action, self._min_bounds[0], self._max_bounds[0])
+        target_action = T.clamp(target_action, self._get_tensor(self._min_bounds, False), self._get_tensor(self._max_bounds, False))
         return target_action
 
     def _store_transition(self, state, action, new_state, reward, terminal):
@@ -212,25 +217,25 @@ class Agent():
         terminal_tensor = self._get_tensor(terminal)
         reward_tensor = self._get_tensor(reward)
 
-        target_actions = self._get_target_action(new_state)[0]
+        target_actions = self._get_target_action(new_state)
         target_critic_value_one = self._target_critic_one(T.cat((new_state_tensor.detach(), target_actions.detach()), 1)).flatten()
         target_critic_value_two = self._target_critic_two(T.cat((new_state_tensor.detach(), target_actions.detach()), 1)).flatten()
         min_critic_value = T.min(target_critic_value_one, target_critic_value_two)
         target = reward_tensor + self._gamma * min_critic_value * (1 - terminal_tensor)
         
-        critic_value_one = self._critic_one(T.cat((state_tensor, action_tensor), 1)).flatten()
-        critic_value_two = self._critic_two(T.cat((state_tensor, action_tensor), 1)).flatten()
+        critic_value_one = self._critic_one(T.cat((state_tensor.detach(), action_tensor.detach()), 1)).flatten()
+        critic_value_two = self._critic_two(T.cat((state_tensor.detach(), action_tensor.detach()), 1)).flatten()
         mse = T.nn.MSELoss()
-        critic_loss_one = mse(critic_value_one, target)
-        critic_loss_two = mse(critic_value_two, target)
+        critic_loss_one = mse(critic_value_one, target.detach())
+        critic_loss_two = mse(critic_value_two, target.detach())
         
         # Gradient step for both critic networks
         self._critic_one.optimizer.zero_grad()
-        critic_loss_one.backward(retain_graph=True)
+        critic_loss_one.backward()
         self._critic_one.optimizer.step()
         
         self._critic_two.optimizer.zero_grad()
-        critic_loss_two.backward(retain_graph=True)
+        critic_loss_two.backward()
         self._critic_two.optimizer.step()
 
     def _gradient_ascent_actor(self, state):
@@ -250,16 +255,17 @@ class Agent():
         self._actor.optimizer.step()
 
     def _learn(self):
-        for _ in range(self._update_epoches):
+        for epoch in range(self._update_epoches):
             samples = self._memory._sample_transition(self._batch_size)
             # Loop through each experience in minibatch
             state, action, new_state, reward, terminal = samples
             
             # Gradients updates
-            self._gradient_descent_critic(np.array(state), np.array(action), np.array(new_state), np.array(reward), np.array(terminal))
-            self._gradient_ascent_actor(np.array(state))
-
-            self._update_network_weights()
+            self._gradient_descent_critic(state, action, new_state, reward, terminal)
+            
+            if epoch % self._policy_delay == 0:
+                self._gradient_ascent_actor(state)
+                self._update_network_weights()
 
 
 "_______________TRAINING______________"
@@ -284,6 +290,12 @@ theta=0.2
 dt=1e-2
 sigma=0.2
 
+min_noise_clip=-0.5 
+max_noise_clip=0.5
+noise_scale=0.2 
+
+policy_delay=2
+
 env = gym.make("LunarLander-v2", 
                continuous= True 
                #render_mode="human"
@@ -298,8 +310,11 @@ agent = Agent(env,
               dt=dt,
               sigma=sigma,
               batch_size=batch_size,
-              memory_size=memory_size)
-
+              memory_size=memory_size,
+              min_noise_clip=min_noise_clip,
+              max_noise_clip=max_noise_clip,
+              noise_scale=noise_scale,
+              policy_delay=policy_delay)
 
 for i in range(1, train_iterations):
 

@@ -228,8 +228,8 @@ class Agent():
             state, action, new_state, reward, terminal = samples
             
             # Gradients updates
-            self._gradient_descent_critic(np.array(state), np.array(action), np.array(new_state), np.array(reward), np.array(terminal))
-            self._gradient_ascent_actor(np.array(state))
+            self._gradient_descent_critic(state, action, new_state, reward, terminal)
+            self._gradient_ascent_actor(state)
 
             self._update_target_actor_weights()
             self._update_target_critic_weights()
