@@ -191,11 +191,13 @@ class SACAgent:
         self.device = torch.device(get_device())
         self.input_dim = self.state_space.shape[0]
         self.output_dim = self.action_space.shape[0]
-        self.actor = ActorNet(self.input_dim, [128], self.output_dim, 0.001).to(self.device)
-        self.value = CriticNet(self.input_dim, [128], 0.001).to(self.device)
-        self.valuetar = CriticNet(self.input_dim, [128], 0.001).to(self.device)
-        self.critic1 = CriticNet(self.input_dim + self.output_dim, [128], 0.001).to(self.device)
-        self.critic2 = CriticNet(self.input_dim + self.output_dim, [128], 0.001).to(self.device)
+        # hidden_layers = [128]
+        hidden_layers = [128, 128]
+        self.actor = ActorNet(self.input_dim, hidden_layers, self.output_dim, 0.001).to(self.device)
+        self.value = CriticNet(self.input_dim, hidden_layers, 0.001).to(self.device)
+        self.valuetar = CriticNet(self.input_dim, hidden_layers, 0.001).to(self.device)
+        self.critic1 = CriticNet(self.input_dim + self.output_dim, hidden_layers, 0.001).to(self.device)
+        self.critic2 = CriticNet(self.input_dim + self.output_dim, hidden_layers, 0.001).to(self.device)
 
         # print(self.actor_net, self.critic_net)
 
@@ -250,10 +252,11 @@ class SACAgent:
         nexts = self.get_tensor(nexts)
         dones = self.get_tensor(dones)
 
-        self.actor.optimizer.zero_grad()
+        # getting sample actions using the current states
         s_actions, s_log_probs = self.actor.sample_normal(states)
         s_log_probs = torch.sum(s_log_probs, dim=1).unsqueeze(1)
 
+        # getting value targets using critic q functions
         self.value.optimizer.zero_grad()
         sq_in = torch.cat((s_actions, states), 1)
         q_val_1 = self.critic1.forward(sq_in)
@@ -261,16 +264,19 @@ class SACAgent:
         q_val = torch.min(q_val_1, q_val_2)
         val_targets = q_val - self.entropy * s_log_probs
 
+        # getting value values and optimizing using value targets
         val = self.value.forward(states)
         val_loss = torch.nn.functional.mse_loss(val, val_targets)
         self.valloss.append(self.get_numpy(val_loss))
         val_loss.backward(retain_graph=True)
         self.value.optimizer.step()
 
+        # getting q function targets using target value network
         n_val = self.valuetar.forward(nexts)
         q_targets = rewards + self.discount * n_val
         q_in = torch.cat((actions, states), 1)
 
+        # optimizing first critic network
         self.critic1.optimizer.zero_grad()
         q_val1 = self.critic1.forward(q_in)
         q_loss1 = torch.nn.functional.mse_loss(q_val1, q_targets)
@@ -278,6 +284,7 @@ class SACAgent:
         q_loss1.backward(retain_graph=True)
         self.critic1.optimizer.step()
 
+        # optimizing second critic network
         self.critic2.optimizer.zero_grad()
         q_val2 = self.critic2.forward(q_in)
         q_loss2 = torch.nn.functional.mse_loss(q_val2, q_targets)
@@ -285,8 +292,13 @@ class SACAgent:
         q_loss2.backward()
         self.critic2.optimizer.step()
 
-        q_actor_1 = self.critic1.forward(sq_in)
-        q_actor_2 = self.critic2.forward(sq_in)
+        # optimizing actor network
+        self.actor.optimizer.zero_grad()
+        s_actions2, s_log_probs2 = self.actor.sample_normal(states)
+        s_log_probs2 = torch.sum(s_log_probs2, dim=1).unsqueeze(1)
+        sq_in2 = torch.cat((s_actions2, states), 1)
+        q_actor_1 = self.critic1.forward(sq_in2)
+        q_actor_2 = self.critic2.forward(sq_in2)
         q_actor = torch.min(q_actor_1, q_actor_2)
         actor_loss = self.entropy * s_log_probs - q_actor
         actor_loss = torch.mean(actor_loss)
