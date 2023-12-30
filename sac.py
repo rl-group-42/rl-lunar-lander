@@ -123,7 +123,7 @@ class ActorNet(nn.Module):
             if end: print("Params End")
 
 
-        std = self.std_layer(output)
+        std = torch.clamp(self.std_layer(output), 0.01, 1)
 
         return mean, std
     
@@ -154,7 +154,7 @@ class CriticNet(nn.Module):
         layers.append(nn.Linear(prev_dim, 1))
         self.network = nn.Sequential(*layers)
 
-        self.optimizer = optim.Adam(self.parameters(), lr = learning_rate)
+        self.optimizer = optim.SGD(self.parameters(), lr = learning_rate)
 
     def forward(self, input):
         output = self.network(input)
@@ -183,15 +183,19 @@ class SACAgent:
         self.discount = discount
 
         self.memory = ReplayBuffer()
+        self.valloss = []
+        self.crit1loss = []
+        self.crit2loss = []
+        self.actorloss = []
 
         self.device = torch.device(get_device())
         self.input_dim = self.state_space.shape[0]
         self.output_dim = self.action_space.shape[0]
-        self.actor = ActorNet(self.input_dim, [128], self.output_dim, 0.01).to(self.device)
-        self.value = CriticNet(self.input_dim, [128], 0.01).to(self.device)
-        self.valuetar = CriticNet(self.input_dim, [128], 0.01).to(self.device)
-        self.critic1 = CriticNet(self.input_dim + self.output_dim, [128], 0.01).to(self.device)
-        self.critic2 = CriticNet(self.input_dim + self.output_dim, [128], 0.01).to(self.device)
+        self.actor = ActorNet(self.input_dim, [128], self.output_dim, 0.001).to(self.device)
+        self.value = CriticNet(self.input_dim, [128], 0.001).to(self.device)
+        self.valuetar = CriticNet(self.input_dim, [128], 0.001).to(self.device)
+        self.critic1 = CriticNet(self.input_dim + self.output_dim, [128], 0.001).to(self.device)
+        self.critic2 = CriticNet(self.input_dim + self.output_dim, [128], 0.001).to(self.device)
 
         # print(self.actor_net, self.critic_net)
 
@@ -229,7 +233,7 @@ class SACAgent:
             terminal = 1 if isterminal or truncated else 0
             self.memory.new_memory(current_state, action, reward, next_state, terminal)
             current_state = next_state
-            if t > self.batch_size and t%10 == 0:
+            if t > self.batch_size and t%50 == 0:
                 self.train_networks()
         print()
         return reward_hist
@@ -259,6 +263,7 @@ class SACAgent:
 
         val = self.value.forward(states)
         val_loss = torch.nn.functional.mse_loss(val, val_targets)
+        self.valloss.append(self.get_numpy(val_loss))
         val_loss.backward(retain_graph=True)
         self.value.optimizer.step()
 
@@ -269,17 +274,23 @@ class SACAgent:
         self.critic1.optimizer.zero_grad()
         q_val1 = self.critic1.forward(q_in)
         q_loss1 = torch.nn.functional.mse_loss(q_val1, q_targets)
+        self.crit1loss.append(self.get_numpy(q_loss1))
         q_loss1.backward(retain_graph=True)
         self.critic1.optimizer.step()
 
         self.critic2.optimizer.zero_grad()
         q_val2 = self.critic2.forward(q_in)
         q_loss2 = torch.nn.functional.mse_loss(q_val2, q_targets)
-        q_loss2.backward(retain_graph=True)
+        self.crit2loss.append(self.get_numpy(q_loss2))
+        q_loss2.backward()
         self.critic2.optimizer.step()
 
-        actor_loss = self.entropy * s_log_probs - q_val
+        q_actor_1 = self.critic1.forward(sq_in)
+        q_actor_2 = self.critic2.forward(sq_in)
+        q_actor = torch.min(q_actor_1, q_actor_2)
+        actor_loss = self.entropy * s_log_probs - q_actor
         actor_loss = torch.mean(actor_loss)
+        self.actorloss.append(self.get_numpy(actor_loss))
         actor_loss.backward()
         self.actor.optimizer.step()
 
@@ -301,11 +312,20 @@ def main():
     # print(env.observation_space.shape[0])
     # print(env.reset()[0])
     # print(type(env.reset()[0]))
-    agent = SACAgent(env, 100, 0.99, 0.95, 0.05)
-    rewards = agent.train(10000)
+    agent = SACAgent(env, 100, 0.99, 0.995, 0.2)
+    rewards = agent.train(50000)
     # print(rewards)
     print(len(rewards))
+    plt.subplot(1, 2, 1)
+    plt.title("Episode Rewards")
     plt.plot(rewards)
+    plt.subplot(1, 2, 2)
+    plt.title("Loss")
+    plt.plot(agent.valloss, label="Value")
+    plt.plot(agent.crit1loss, label="Critic 1")
+    plt.plot(agent.crit2loss, label="Critic 2")
+    plt.plot(agent.actorloss, label="Actor")
+    plt.legend()
     plt.show()
     # print(len(agent.memory.buffer))
     # print(agent.get_action(env.reset()[0]))
