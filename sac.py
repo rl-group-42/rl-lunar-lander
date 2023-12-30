@@ -259,7 +259,7 @@ class SACAgent:
 
         val = self.value.forward(states)
         val_loss = torch.nn.functional.mse_loss(val, val_targets)
-        val_loss.backward()
+        val_loss.backward(retain_graph=True)
         self.value.optimizer.step()
 
         n_val = self.valuetar.forward(nexts)
@@ -269,60 +269,20 @@ class SACAgent:
         self.critic1.optimizer.zero_grad()
         q_val1 = self.critic1.forward(q_in)
         q_loss1 = torch.nn.functional.mse_loss(q_val1, q_targets)
-        q_loss1.backward()
+        q_loss1.backward(retain_graph=True)
         self.critic1.optimizer.step()
 
         self.critic2.optimizer.zero_grad()
         q_val2 = self.critic2.forward(q_in)
         q_loss2 = torch.nn.functional.mse_loss(q_val2, q_targets)
-        q_loss2.backward()
+        q_loss2.backward(retain_graph=True)
         self.critic2.optimizer.step()
 
         actor_loss = self.entropy * s_log_probs - q_val
+        actor_loss = torch.mean(actor_loss)
         actor_loss.backward()
         self.actor.optimizer.step()
 
-        # # self.actor.optimizer.zero_grad()
-        # sample_actions, log_probs = self.get_action(nexts) # maybe need to get the tensor version for log probs
-        # # print(log_probs)
-        # log_probs = torch.sum(log_probs, dim=1)
-        # # print(log_probs)
-        # next1 = self.critic1tar.forward(self.get_crit_in(sample_actions, nexts))
-        # next2 = self.critic2tar.forward(self.get_crit_in(sample_actions, nexts))
-        # next_estimate = self.get_numpy(torch.min(next1, next2)).flatten()
-        # targets = rewards + self.discount*(1-dones) * \
-        #     (next_estimate - (self.entropy * self.get_numpy(log_probs)))
-        # targets = self.get_tensor(targets.reshape(-1, 1))
-
-        # self.critic1.optimizer.zero_grad()
-        # loss1 = self.critic1.forward(self.get_crit_in(actions, states))
-        # loss1 = torch.nn.functional.mse_loss(loss1, targets)
-        # loss1.backward()
-        # self.critic1.optimizer.step()
-
-        # self.critic2.optimizer.zero_grad()
-        # loss2 = self.critic2.forward(self.get_crit_in(actions, states))
-        # loss2 = torch.nn.functional.mse_loss(loss2, targets)
-        # loss2.backward()
-        # self.critic2.optimizer.step()
-
-        # curr1 = self.critic1.forward(self.get_crit_in(sample_actions, states))
-        # curr2 = self.critic2.forward(self.get_crit_in(sample_actions, states))
-        # curr = torch.min(curr1, curr2).flatten()
-        # # log_probs_ten = self.get_tensor(log_probs)
-        # # print(curr - (self.entropy * log_probs))
-        # actorloss = torch.mean(curr - (self.entropy * log_probs))
-        # # torch.nn.utils.clip_grad()
-        # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
-        # # print("Actor Loss: " + str(actorloss))
-        # if torch.isnan(actorloss):
-        #     print(actorloss)
-        #     print(curr)
-        #     print(self.entropy)
-        #     print(log_probs)
-        #     print((self.entropy * log_probs) - curr)
-        # actorloss.backward()
-        # self.actor.optimizer.step()
         self.polyak_update()
 
     def polyak_update(self):
@@ -334,6 +294,7 @@ class SACAgent:
 def main():
     env = gym.make("LunarLander-v2", 
          continuous=True)
+    torch.autograd.set_detect_anomaly(True)
     # print(env.action_space)
     # print(env.action_space.shape)
     # print(env.observation_space)
