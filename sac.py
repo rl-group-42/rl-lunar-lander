@@ -86,20 +86,42 @@ class ActorNet(nn.Module):
         prev_dim = input_dim
         for dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, dim))
-            layers.append(nn.LeakyReLU())
+            # layers.append(nn.LeakyReLU())
+            layers.append(nn.ReLU())
             prev_dim = dim
         self.network = nn.Sequential(*layers)
-        self.mean_layer = nn.Sequential(nn.Linear(prev_dim, output_dim), nn.Tanh())
+        # self.mean_layer = nn.Sequential(nn.Linear(prev_dim, output_dim), nn.Tanh())
+        self.mean_layer = nn.Linear(prev_dim, output_dim)
         self.std_layer = nn.Sequential(nn.Linear(prev_dim, output_dim), nn.Softplus())
 
-        self.optimizer = optim.Adam(self.parameters(), lr = learning_rate)
+        # self.optimizer = optim.Adam(self.parameters(), lr = learning_rate)
+        self.optimizer = optim.SGD(self.parameters(), lr = learning_rate)
 
     # gets a mean and standard deviation value for each action
     def forward(self, state):
         output = self.network(state)
-        # typeprint(output)
         mean = self.mean_layer(output)
-        # typeprint(mean)
+        if torch.isnan(mean[0][0]):
+            print("||ACTOR FORWARD PASS||")
+            print(state)
+            typeprint(output)
+            typeprint(mean)
+            for param in self.parameters():
+                print(param)
+        
+        for paramin in self.parameters():
+            # print("parameters")
+            end = False
+            param = paramin
+            while len(param.shape) > 0:
+                param = param[0]
+            # print(len(param[0].shape))
+            # print(param[0][0])
+            if param.isnan():
+                print(paramin)
+                end = True
+            if end: print("Params End")
+
 
         std = self.std_layer(output)
 
@@ -166,10 +188,10 @@ class SACAgent:
         self.input_dim = self.state_space.shape[0]
         self.output_dim = self.action_space.shape[0]
         self.actor = ActorNet(self.input_dim, [128], self.output_dim, 0.01).to(self.device)
+        self.value = CriticNet(self.input_dim, [128], 0.01).to(self.device)
+        self.valuetar = CriticNet(self.input_dim, [128], 0.01).to(self.device)
         self.critic1 = CriticNet(self.input_dim + self.output_dim, [128], 0.01).to(self.device)
         self.critic2 = CriticNet(self.input_dim + self.output_dim, [128], 0.01).to(self.device)
-        self.critic1tar = CriticNet(self.input_dim + self.output_dim, [128], 0.01).to(self.device)
-        self.critic2tar = CriticNet(self.input_dim + self.output_dim, [128], 0.01).to(self.device)
 
         # print(self.actor_net, self.critic_net)
 
@@ -182,7 +204,12 @@ class SACAgent:
     def get_action(self, state):
         state_tensor = self.get_tensor(state)
         action, std = self.actor.sample_normal(state_tensor)
-        return self.get_numpy(action), self.get_numpy(std)
+        return action, std
+    
+    def get_single_action(self, state):
+        state_tensor = self.get_tensor(state).unsqueeze(0)
+        action, std = self.actor.sample_normal(state_tensor)
+        return self.get_numpy(action.squeeze()), std
     
     def train(self, maxsteps):
         print("Starting episode 1 at timestep 0", end="")
@@ -191,18 +218,18 @@ class SACAgent:
         terminal = True
         for t in range(maxsteps):
             if terminal:
-                current_state = self.env.reset()[0]
+                current_state = self.env.reset(seed=1)[0]
                 reward_hist.append(total_reward)
                 total_reward = 0
-                print("\rStarting episode " + str(len(reward_hist)+1) + " at timestep " + str(t), end="")
+                print("\rStarting episode " + str(len(reward_hist)+1) + " at timestep " + str(t) + " previous score: " + str(reward_hist[-1]), end="")
             
-            action, _ = self.get_action(current_state)
+            action, _ = self.get_single_action(current_state)
             next_state, reward, isterminal, truncated, _ = self.env.step(action)
             total_reward += reward
             terminal = 1 if isterminal or truncated else 0
             self.memory.new_memory(current_state, action, reward, next_state, terminal)
             current_state = next_state
-            if t > self.batch_size:
+            if t > self.batch_size and t%10 == 0:
                 self.train_networks()
         print()
         return reward_hist
@@ -213,44 +240,93 @@ class SACAgent:
     # memory: 0 state, 1 action, 2 reward, 3 next, 4 done
     def train_networks(self):
         states, actions, rewards, nexts, dones = self.memory.rand_sample_split(self.batch_size)
-        # targets = []
+        states = self.get_tensor(states)
+        actions = self.get_tensor(actions)
+        rewards = self.get_tensor(rewards).unsqueeze(1)
+        nexts = self.get_tensor(nexts)
+        dones = self.get_tensor(dones)
 
         self.actor.optimizer.zero_grad()
-        sample_actions, log_probs = self.get_action(nexts) # maybe need to get the tensor version for log probs
-        log_probs = log_probs.sum(1)
-        next1 = self.critic1tar.forward(self.get_crit_in(sample_actions, nexts))
-        next2 = self.critic2tar.forward(self.get_crit_in(sample_actions, nexts))
-        next_estimate = self.get_numpy(torch.min(next1, next2)).flatten()
-        targets = rewards + self.discount*(1-dones) * \
-            (next_estimate - (self.entropy * log_probs))
-        targets = self.get_tensor(targets.reshape(-1, 1))
+        s_actions, s_log_probs = self.actor.sample_normal(states)
+        s_log_probs = torch.sum(s_log_probs, dim=1).unsqueeze(1)
+
+        self.value.optimizer.zero_grad()
+        sq_in = torch.cat((s_actions, states), 1)
+        q_val_1 = self.critic1.forward(sq_in)
+        q_val_2 = self.critic2.forward(sq_in)
+        q_val = torch.min(q_val_1, q_val_2)
+        val_targets = q_val - self.entropy * s_log_probs
+
+        val = self.value.forward(states)
+        val_loss = torch.nn.functional.mse_loss(val, val_targets)
+        val_loss.backward()
+        self.value.optimizer.step()
+
+        n_val = self.valuetar.forward(nexts)
+        q_targets = rewards + self.discount * n_val
+        q_in = torch.cat((actions, states), 1)
 
         self.critic1.optimizer.zero_grad()
-        loss1 = self.critic1.forward(self.get_crit_in(actions, states))
-        loss1 = torch.nn.functional.mse_loss(loss1, targets)
-        loss1.backward()
+        q_val1 = self.critic1.forward(q_in)
+        q_loss1 = torch.nn.functional.mse_loss(q_val1, q_targets)
+        q_loss1.backward()
         self.critic1.optimizer.step()
 
         self.critic2.optimizer.zero_grad()
-        loss2 = self.critic2.forward(self.get_crit_in(actions, states))
-        loss2 = torch.nn.functional.mse_loss(loss2, targets)
-        loss2.backward()
+        q_val2 = self.critic2.forward(q_in)
+        q_loss2 = torch.nn.functional.mse_loss(q_val2, q_targets)
+        q_loss2.backward()
         self.critic2.optimizer.step()
 
-        curr1 = self.critic1.forward(self.get_crit_in(sample_actions, states))
-        curr2 = self.critic2.forward(self.get_crit_in(sample_actions, states))
-        curr = torch.min(curr1, curr2).flatten()
-        log_probs_ten = self.get_tensor(log_probs)
-        actorloss = torch.mean(curr - (self.entropy * log_probs_ten))
-        actorloss.backward()
+        actor_loss = self.entropy * s_log_probs - q_val
+        actor_loss.backward()
         self.actor.optimizer.step()
+
+        # # self.actor.optimizer.zero_grad()
+        # sample_actions, log_probs = self.get_action(nexts) # maybe need to get the tensor version for log probs
+        # # print(log_probs)
+        # log_probs = torch.sum(log_probs, dim=1)
+        # # print(log_probs)
+        # next1 = self.critic1tar.forward(self.get_crit_in(sample_actions, nexts))
+        # next2 = self.critic2tar.forward(self.get_crit_in(sample_actions, nexts))
+        # next_estimate = self.get_numpy(torch.min(next1, next2)).flatten()
+        # targets = rewards + self.discount*(1-dones) * \
+        #     (next_estimate - (self.entropy * self.get_numpy(log_probs)))
+        # targets = self.get_tensor(targets.reshape(-1, 1))
+
+        # self.critic1.optimizer.zero_grad()
+        # loss1 = self.critic1.forward(self.get_crit_in(actions, states))
+        # loss1 = torch.nn.functional.mse_loss(loss1, targets)
+        # loss1.backward()
+        # self.critic1.optimizer.step()
+
+        # self.critic2.optimizer.zero_grad()
+        # loss2 = self.critic2.forward(self.get_crit_in(actions, states))
+        # loss2 = torch.nn.functional.mse_loss(loss2, targets)
+        # loss2.backward()
+        # self.critic2.optimizer.step()
+
+        # curr1 = self.critic1.forward(self.get_crit_in(sample_actions, states))
+        # curr2 = self.critic2.forward(self.get_crit_in(sample_actions, states))
+        # curr = torch.min(curr1, curr2).flatten()
+        # # log_probs_ten = self.get_tensor(log_probs)
+        # # print(curr - (self.entropy * log_probs))
+        # actorloss = torch.mean(curr - (self.entropy * log_probs))
+        # # torch.nn.utils.clip_grad()
+        # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5)
+        # # print("Actor Loss: " + str(actorloss))
+        # if torch.isnan(actorloss):
+        #     print(actorloss)
+        #     print(curr)
+        #     print(self.entropy)
+        #     print(log_probs)
+        #     print((self.entropy * log_probs) - curr)
+        # actorloss.backward()
+        # self.actor.optimizer.step()
         self.polyak_update()
 
     def polyak_update(self):
-        for target, real in zip(self.critic1tar.parameters(), self.critic1.parameters()):
-            target.data.copy_(self.polyak * target.data + (1-self.polyak) * real.data)
-
-        for target, real in zip(self.critic2tar.parameters(), self.critic2.parameters()):
+        for target, real in zip(self.valuetar.parameters(), self.value.parameters()):
             target.data.copy_(self.polyak * target.data + (1-self.polyak) * real.data)
 
     
@@ -264,8 +340,8 @@ def main():
     # print(env.observation_space.shape[0])
     # print(env.reset()[0])
     # print(type(env.reset()[0]))
-    agent = SACAgent(env, 5, 0.99, 0.99, 0.01)
-    rewards = agent.train(100000)
+    agent = SACAgent(env, 100, 0.99, 0.95, 0.05)
+    rewards = agent.train(10000)
     # print(rewards)
     print(len(rewards))
     plt.plot(rewards)
