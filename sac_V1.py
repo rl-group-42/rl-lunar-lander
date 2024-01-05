@@ -149,9 +149,16 @@ class CriticNet(nn.Module):
         prev_dim = input_dim
         for dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, dim))
+            layers.append(nn.BatchNorm1d(dim))
             layers.append(nn.LeakyReLU())
             prev_dim = dim
-        layers.append(nn.Linear(prev_dim, 1))
+        output_layer = nn.Linear(prev_dim, 1)
+        range = 3e-3
+        output_layer.weight.data.uniform_(
+            -range, +range)
+        output_layer.bias.data.uniform_(
+            -range, +range)
+        layers.append(output_layer)
         self.network = nn.Sequential(*layers)
 
         self.optimizer = optim.SGD(self.parameters(), lr = learning_rate)
@@ -192,12 +199,14 @@ class SACAgent:
         self.input_dim = self.state_space.shape[0]
         self.output_dim = self.action_space.shape[0]
         # hidden_layers = [128]
-        hidden_layers = [128, 128]
-        self.actor = ActorNet(self.input_dim, hidden_layers, self.output_dim, 0.001).to(self.device)
-        self.value = CriticNet(self.input_dim, hidden_layers, 0.001).to(self.device)
-        self.valuetar = CriticNet(self.input_dim, hidden_layers, 0.001).to(self.device)
-        self.critic1 = CriticNet(self.input_dim + self.output_dim, hidden_layers, 0.001).to(self.device)
-        self.critic2 = CriticNet(self.input_dim + self.output_dim, hidden_layers, 0.001).to(self.device)
+        hidden_layers = [500, 500]
+        # l_rate = 0.001
+        l_rate = 0.0001
+        self.actor = ActorNet(self.input_dim, hidden_layers, self.output_dim, l_rate).to(self.device)
+        self.value = CriticNet(self.input_dim, hidden_layers, l_rate).to(self.device)
+        self.valuetar = CriticNet(self.input_dim, hidden_layers, l_rate).to(self.device)
+        self.critic1 = CriticNet(self.input_dim + self.output_dim, hidden_layers, l_rate).to(self.device)
+        self.critic2 = CriticNet(self.input_dim + self.output_dim, hidden_layers, l_rate).to(self.device)
 
         # print(self.actor_net, self.critic_net)
 
@@ -225,9 +234,10 @@ class SACAgent:
         for t in range(maxsteps):
             if terminal:
                 current_state = self.env.reset(seed=1)[0]
-                reward_hist.append(total_reward)
-                total_reward = 0
-                print("\rStarting episode " + str(len(reward_hist)+1) + " at timestep " + str(t) + " previous score: " + str(reward_hist[-1]), end="")
+                if t > 0:
+                    reward_hist.append(total_reward)
+                    total_reward = 0
+                    print("\rStarting episode " + str(len(reward_hist)+1) + " at timestep " + str(t) + " previous score: " + str(reward_hist[-1]), end="")
             
             action, _ = self.get_single_action(current_state)
             next_state, reward, isterminal, truncated, _ = self.env.step(action)
@@ -235,8 +245,8 @@ class SACAgent:
             terminal = 1 if isterminal or truncated else 0
             self.memory.new_memory(current_state, action, reward, next_state, terminal)
             current_state = next_state
-            if t > self.batch_size and t%50 == 0:
-                self.train_networks()
+            # if t > self.batch_size and t%5 == 0:
+                # self.train_networks()
         print()
         return reward_hist
 
@@ -262,18 +272,19 @@ class SACAgent:
         q_val_1 = self.critic1.forward(sq_in)
         q_val_2 = self.critic2.forward(sq_in)
         q_val = torch.min(q_val_1, q_val_2)
-        val_targets = q_val - self.entropy * s_log_probs
+        val_targets = q_val - (self.entropy * s_log_probs)
 
         # getting value values and optimizing using value targets
         val = self.value.forward(states)
         val_loss = torch.nn.functional.mse_loss(val, val_targets)
         self.valloss.append(self.get_numpy(val_loss))
         val_loss.backward(retain_graph=True)
+        torch.nn.utils.clip_grad_value_(self.value.parameters(), 1)
         self.value.optimizer.step()
 
         # getting q function targets using target value network
         n_val = self.valuetar.forward(nexts)
-        q_targets = rewards + self.discount * n_val
+        q_targets = rewards + (self.discount * n_val)
         q_in = torch.cat((actions, states), 1)
 
         # optimizing first critic network
@@ -300,7 +311,7 @@ class SACAgent:
         q_actor_1 = self.critic1.forward(sq_in2)
         q_actor_2 = self.critic2.forward(sq_in2)
         q_actor = torch.min(q_actor_1, q_actor_2)
-        actor_loss = self.entropy * s_log_probs - q_actor
+        actor_loss = (self.entropy * s_log_probs) - q_actor
         actor_loss = torch.mean(actor_loss)
         self.actorloss.append(self.get_numpy(actor_loss))
         actor_loss.backward()
@@ -310,7 +321,7 @@ class SACAgent:
 
     def polyak_update(self):
         for target, real in zip(self.valuetar.parameters(), self.value.parameters()):
-            target.data.copy_(self.polyak * target.data + (1-self.polyak) * real.data)
+            target.data.copy_((self.polyak * target.data) + ((1-self.polyak) * real.data))
 
     
     # env: gym.Env, batch_size, discount, start_training, polyak, entropy
@@ -324,13 +335,54 @@ def main():
     # print(env.observation_space.shape[0])
     # print(env.reset()[0])
     # print(type(env.reset()[0]))
-    agent = SACAgent(env, 100, 0.99, 0.995, 0.2)
-    rewards = agent.train(50000)
+    agent = SACAgent(env, 10, 0.99, 0.9995, 0.02)
+    rewards = agent.train(20)
     # print(rewards)
+    valgrads = []
+    crit1grads = []
+    crit2grads = []
+    actgrads = []
+    for x in range(1000):
+        agent.train_networks()
+        if x % 10 == 0:
+            print("\rMinibatches Trained: " + str(x), end="")
+        if x%1 == 0:
+            # print()
+            # print("value parameter norms")
+            gradtot = 0
+            for param in agent.value.parameters():
+                # print(param.grad.norm())
+                gradtot += param.grad.norm()
+            # print("total: " + str(gradtot))
+            valgrads.append(gradtot)
+            gradtot = 0
+            for param in agent.critic1.parameters():
+                # print(param.grad.norm())
+                gradtot += param.grad.norm()
+            # print("total: " + str(gradtot))
+            crit1grads.append(gradtot)
+            gradtot = 0
+            for param in agent.critic2.parameters():
+                # print(param.grad.norm())
+                gradtot += param.grad.norm()
+            # print("total: " + str(gradtot))
+            crit2grads.append(gradtot)
+            gradtot = 0
+            for param in agent.actor.parameters():
+                # print(param.grad.norm())
+                gradtot += param.grad.norm()
+            # print("total: " + str(gradtot))
+            actgrads.append(gradtot)
+    print()
     print(len(rewards))
     plt.subplot(1, 2, 1)
-    plt.title("Episode Rewards")
-    plt.plot(rewards)
+    # plt.title("Episode Rewards")
+    # plt.plot(rewards)
+    plt.title("Gradient Norms")
+    plt.plot(valgrads, label="Value")
+    plt.plot(crit1grads, label="Critic 1")
+    plt.plot(crit2grads, label="Critic 2")
+    plt.plot(actgrads, label="Actor")
     plt.subplot(1, 2, 2)
     plt.title("Loss")
     plt.plot(agent.valloss, label="Value")
