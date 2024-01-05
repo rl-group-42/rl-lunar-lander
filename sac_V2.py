@@ -9,6 +9,7 @@ from torch import cuda
 from torch.backends import mps
 from collections import deque
 import matplotlib.pyplot as plt
+import time
 
 def get_device() -> str:
     """ Get Device Name """
@@ -22,6 +23,41 @@ def get_device() -> str:
 def typeprint(var):
     print(type(var))
     print(var)
+
+class Logger:
+    episodes = []
+    optimal = []
+    optimaleps = []
+
+    actions = []
+
+    def __init__(self):
+        self.episodes.append(["t", "length", "reward"])
+        self.optimal.append(["t", "avg"])
+        self.optimaleps.append(["t", "reward"])
+
+    # def addep(self, t, length, reward):
+
+    def export(self, agent):
+        name = "tests\\" + str(int(time.time()))
+        with open(name + "_eps.csv", "w") as file:
+            for ep in self.episodes:
+                file.write(",".join([str(x) for x in ep]) + "\n")
+        with open(name + "_optim.csv", "w") as file:
+            for data in self.optimal:
+                file.write(",".join([str(x) for x in data]) + "\n")
+        with open(name + "_optim_eps.csv", "w") as file:
+            for data in self.optimaleps:
+                file.write(",".join([str(x) for x in data]) + "\n")
+        with open(name + "_info.txt", "w") as file:
+            file.write(f"entropy (alpha): {agent.entropy}\n")
+            file.write(f"discount (gamma): {agent.discount}\n")
+            file.write(f"polyak (1-tau): {agent.polyak}\n")
+            file.write(f"learning rate: {agent.l_rate}\n")
+            file.write(f"network structure: {agent.hidden}\n")
+            file.write(f"minibatch size: {agent.batch_size}\n")
+
+
 
 # Stores experiences from the agent
 # State - current state
@@ -107,7 +143,7 @@ class ActorNet(nn.Module):
         mean, logstd = self.forward(state)
         std = logstd.exp()
         dist = torch.distributions.Normal(mean, std)
-        sample = dist.sample()
+        sample = dist.rsample() # used to just be sample, source of all my problems?
         action = torch.tanh(sample)
 
         log_prob = dist.log_prob(sample)
@@ -157,7 +193,11 @@ class SACAgent:
         self.discount = 0.99 # gamma
         self.polyak = 0.99 # 1 - tau
         l_rate = 0.001
-        hidden = [500, 500, 500, 500]
+        hidden = [500, 500, 500]
+
+        # for logging
+        self.l_rate = l_rate
+        self.hidden = hidden
 
         self.batch_size = 256
 
@@ -202,7 +242,7 @@ class SACAgent:
         # output += ", truncated: " + str(sum(ends[bindex:])) + "%  "
         print("\r" + output, end="")
 
-    def run_ep(self):
+    def run_ep(self, t):
 
         terminal = False
         state = self.env.reset()[0]
@@ -212,13 +252,16 @@ class SACAgent:
             state, reward, isterminal, truncated, _ = self.env.step(self.get_numpy(action))
             terminal = isterminal or truncated
             epreward += reward
+        logger.optimaleps.append([t, epreward])
         return epreward
     
-    def runs_avg(self, runs):
+    def runs_avg(self, runs, t):
         rewards = []
         for _ in range(runs):
-            rewards.append(self.run_ep())
-        return sum(rewards)/runs
+            rewards.append(self.run_ep(t))
+        avg = sum(rewards)/runs
+        logger.optimal.append([t, avg])
+        return avg
 
     def train(self, episodes, maxsteps=200000, exploration=4000):
         reward_hist = []
@@ -231,9 +274,9 @@ class SACAgent:
         for t in range(maxsteps):
             if len(ends) >= episodes: 
                 break
+            if t % 4000 == 0:
+                print("real score: " + str(int(self.runs_avg(100, t))))
             if terminal:
-                if len(ends) % 100 == 0:
-                    print("real score: " + str(self.runs_avg(100)) + "                                             ")
                 # current_state = self.env.reset(seed=1)[0]
                 current_state = self.env.reset()[0]
 
@@ -241,6 +284,10 @@ class SACAgent:
                 ends.append(truncated)
                 lens.append(t-ep_start)
                 self.printstatus(t, reward_hist, ends, lens)
+
+                # logging
+                logger.episodes.append([t, t-ep_start, total_reward])
+                
 
                 total_reward = 0
                 ep_start = t
@@ -250,6 +297,7 @@ class SACAgent:
                 action = self.env.action_space.sample()
             else:
                 action, _ = self.get_single_action(current_state)
+            logger.actions.append(action)
             next_state, reward, isterminal, truncated, _ = self.env.step(action)
             total_reward += reward
             terminal = 1 if isterminal or truncated else 0
@@ -337,21 +385,55 @@ def main():
     # print(env.reset()[0])
     # print(type(env.reset()[0]))
     agent = SACAgent(env)
-    rewards = agent.train(10000, maxsteps=2000000, exploration=10000)
-
-    print("final avg score: " + str(agent.runs_avg(100)))
+    rewards = agent.train(200, maxsteps=20000000, exploration=4000)
+    logger.export(agent)
+    # print("final avg score: " + str(agent.runs_avg(100)))
     # exit()
-
+    i = 0
+    batch = 100
+    print(len(logger.actions))
+    print(logger.actions[0])
+    # logger.actions = np.array(logger.actions)
+    act_mean = []
+    act_std = []
+    while i + batch < len(logger.actions):
+        arr = np.array(logger.actions[i:i+batch])
+        # arr.mean()
+        print(arr.mean())
+        print(arr.std())
+        print(arr.mean(axis=0))
+        print(arr.std(axis=0))
+        act_mean.append(arr.mean(axis=0))
+        act_std.append(arr.std(axis=0))
+        i += batch
+    
     print()
     print(len(rewards))
-    plt.subplot(1, 2, 1)
-    plt.title("Episode Rewards - low discount")
-    plt.plot(rewards)
+    # plt.subplot(1, 2, 1)
+    # plt.title("Episode Rewards")
+    # plt.plot(rewards)
     # plt.title("Gradient Norms")
     # plt.plot(valgrads, label="Value")
     # plt.plot(crit1grads, label="Critic 1")
     # plt.plot(crit2grads, label="Critic 2")
     # plt.plot(actgrads, label="Actor")
+    plt.subplot(1, 2, 1)
+    plt.title("Actions")
+    m = np.array([x[0] for x in act_mean])
+    d = np.array([x[0] for x in act_std])
+    plt.plot(m, label="Action 0 Mean")
+    plt.fill_between(range(len(m)), m-d, m+d, label="Action 0 Std Dev", alpha=0.5)
+    m = np.array([x[1] for x in act_mean])
+    d = np.array([x[1] for x in act_std])
+    plt.plot(m, label="Action 1 Mean")
+    plt.fill_between(range(len(m)), m-d, m+d, label="Action 1 Std Dev", alpha=0.5)
+    # plt.plot([x[0] for x in act_std], label="Action 0 Std Dev", color="blue")
+    # plt.plot([x[1] for x in act_mean], label="Action 1 Mean", color="orange")
+    # plt.plot([x[1] for x in act_std], label="Action 1 Std Dev", color="red")
+    # plt.plot(, label="")
+    # plt.plot(, label="")
+    # plt.plot(, label="")
+    # plt.plot(, label="")
     plt.subplot(1, 2, 2)
     plt.title("Loss")
     # plt.plot(agent.valloss, label="Value")
@@ -362,6 +444,8 @@ def main():
     plt.show()
     # print(len(agent.memory.buffer))
     # print(agent.get_action(env.reset()[0]))
+
+logger = Logger()
 
 if __name__ == "__main__":
     main() 
