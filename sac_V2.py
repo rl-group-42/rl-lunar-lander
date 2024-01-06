@@ -193,13 +193,13 @@ class SACAgent:
         self.discount = 0.99 # gamma
         self.polyak = 0.99 # 1 - tau
         l_rate = 0.001
-        hidden = [500, 500, 500]
+        hidden = [200, 200]
 
         # for logging
         self.l_rate = l_rate
         self.hidden = hidden
 
-        self.batch_size = 256
+        self.batch_size = 128
 
         self.actor = ActorNet(input_dim, output_dim, l_rate=l_rate, hidden_dims=hidden).to(self.device)
         self.critic1 = CriticNet(input_dim + output_dim, l_rate=l_rate, hidden_dims=hidden).to(self.device)
@@ -385,24 +385,24 @@ def main():
     # print(env.reset()[0])
     # print(type(env.reset()[0]))
     agent = SACAgent(env)
-    rewards = agent.train(200, maxsteps=20000000, exploration=4000)
+    rewards = agent.train(1200, maxsteps=20000000, exploration=4000)
     logger.export(agent)
     # print("final avg score: " + str(agent.runs_avg(100)))
     # exit()
     i = 0
     batch = 100
-    print(len(logger.actions))
-    print(logger.actions[0])
+    # print(len(logger.actions))
+    # print(logger.actions[0])
     # logger.actions = np.array(logger.actions)
     act_mean = []
     act_std = []
     while i + batch < len(logger.actions):
         arr = np.array(logger.actions[i:i+batch])
         # arr.mean()
-        print(arr.mean())
-        print(arr.std())
-        print(arr.mean(axis=0))
-        print(arr.std(axis=0))
+        # print(arr.mean())
+        # print(arr.std())
+        # print(arr.mean(axis=0))
+        # print(arr.std(axis=0))
         act_mean.append(arr.mean(axis=0))
         act_std.append(arr.std(axis=0))
         i += batch
