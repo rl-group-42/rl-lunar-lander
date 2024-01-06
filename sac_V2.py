@@ -50,7 +50,8 @@ class Logger:
             for data in self.optimaleps:
                 file.write(",".join([str(x) for x in data]) + "\n")
         with open(name + "_info.txt", "w") as file:
-            file.write(f"entropy (alpha): {agent.entropy}\n")
+            file.write(f"entropy Start (alpha): {agent.entropy}\n")
+            file.write(f"entropy zero(alpha): {agent.entropy}\n")
             file.write(f"discount (gamma): {agent.discount}\n")
             file.write(f"polyak (1-tau): {agent.polyak}\n")
             file.write(f"learning rate: {agent.l_rate}\n")
@@ -189,11 +190,13 @@ class SACAgent:
 
 
         # new stuff vv
-        self.entropy = 0.15 # alpha 0.2 start
+        self.entropystart = 0.3 # alpha 0.2 start
+        self.entropy = self.entropystart
+        self.entropyzero = 0.9
         self.discount = 0.99 # gamma
         self.polyak = 0.99 # 1 - tau
-        l_rate = 0.001
-        hidden = [200, 200]
+        l_rate = 0.0003
+        hidden = [512, 512]
 
         # for logging
         self.l_rate = l_rate
@@ -303,6 +306,7 @@ class SACAgent:
             terminal = 1 if isterminal or truncated else 0
             self.memory.new_memory(current_state, action, reward, next_state, terminal)
             current_state = next_state
+            if self.entropyzero > 0: self.entropy = max(0, self.entropystart * (1 - (len(lens)/episodes) / self.entropyzero))
             if t == exploration: 
                 for _ in range(100): self.train_networks()
             if t > exploration:
