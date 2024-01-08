@@ -1,118 +1,107 @@
-import os
 import gym
 import numpy as np
 import torch
 from torch.optim import Adam
-from torch.utils.data import WeightedRandomSampler
 from torch.distributions import Normal
 import torch.nn as nn
-
 from collections import deque
-import itertools
-import math
-import random
+import time
 
+
+# this code is an implementation of the algorithm DroQ as described in the paper
+# Dropout Q-Functions for Doubly Efficient Reinforcement Learning by
+# Takuya Hiraoka et al.
+# some inspiration was taken from Hiraoka's GitHub page found at
+# https://github.com/TakuyaHiraoka/Dropout-Q-Functions-for-Doubly-Efficient-Reinforcement-Learning
+
+
+# main agent
 class Agent:
+    # gamma = Discount factor
+    # tau = network soft update param
+    def __init__(self, env, max_steps=500000, batch_size=256,
+                 learning_rate=0.001, hidden_units=[256, 256], memory_size=1e6,
+                 gamma=0.98, tau=0.01, multi_step=1, grad_clip=None, updates_per_step=1,
+                 start_steps=10000, log_interval=10, target_update_interval=1,
+                 eval_interval=4000, eval_runs=100, layer_norm=0,
+                 target_entropy=None, target_drop_rate=0.0, critic_update_delay=1):
 
-    def __init__(self, env, num_steps=30000000, batch_size=256,
-                 lr=0.0003, hidden_units=[256, 256], memory_size=1e6,
-                 gamma=0.99, tau=0.005, entropy_tuning=True, ent_coef=0.2,
-                 multi_step=1, per=False, alpha=0.6, beta=0.4,
-                 beta_annealing=0.0001, grad_clip=None, updates_per_step=1,
-                 start_steps=10000, log_interval=1000, target_update_interval=1,
-                 eval_interval=1000, cuda=0, seed=0,
-                 eval_runs=1, huber=0, layer_norm=0,
-                 method=None, target_entropy=None, target_drop_rate=0.0, critic_update_delay=1):
         self.env = env
-
-        torch.backends.cudnn.deterministic = True  # It harms a performance.
-        torch.backends.cudnn.benchmark = False
-
-        self.method = method
         self.critic_update_delay = critic_update_delay
         self.target_drop_rate = target_drop_rate
-
-        self.device = torch.device("cuda:" + str(cuda) if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cpu")
 
         # policy
-        self.policy = GaussianPolicy(
+        self.policy = Actor(
             self.env.observation_space.shape[0],
             self.env.action_space.shape[0],
             hidden_units=hidden_units).to(self.device)
 
         # Q functions
-        kwargs_q = {"num_inputs": self.env.observation_space.shape[0],
-                    "num_actions": self.env.action_space.shape[0],
-                    "hidden_units": hidden_units,
-                    "layer_norm": layer_norm,
-                    "drop_rate": self.target_drop_rate}
-        self.critic = TwinnedQNetwork(**kwargs_q).to(self.device)
-        self.critic_target = TwinnedQNetwork(**kwargs_q).to(self.device)
+        qfuncs = {"input_dim": self.env.observation_space.shape[0],
+                  "output_dim": self.env.action_space.shape[0],
+                  "hidden_units": hidden_units,
+                  "layer_norm": layer_norm,
+                  "drop_rate": self.target_drop_rate}
+        self.critic = TwinnedQNetwork(**qfuncs).to(self.device)
+        self.critic_target = TwinnedQNetwork(**qfuncs).to(self.device)
         if self.target_drop_rate <= 0.0:
             self.critic_target = self.critic_target.eval()
-        hard_update(self.critic_target, self.critic)
-        grad_false(self.critic_target)
+        # copy parameters of the learning network to the target network
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        # disable gradient calculations of the target network
+        for param in self.critic_target.parameters():
+            param.requires_grad = False
 
-        self.q1_optim = Adam(self.critic.Q1.parameters(), lr=lr)
-        self.q2_optim = Adam(self.critic.Q2.parameters(), lr=lr)
+        # optimizer
+        self.policy_optim = Adam(self.policy.parameters(), lr=learning_rate)
+        self.q1_optim = Adam(self.critic.Q1.parameters(), lr=learning_rate)
+        self.q2_optim = Adam(self.critic.Q2.parameters(), lr=learning_rate)
 
-        if entropy_tuning:
-            if not (target_entropy is None):
-                self.target_entropy = torch.prod(torch.Tensor([target_entropy]).to(self.device)).item()
-            else:
-                # Target entropy is -|A|.
-                self.target_entropy = -torch.prod(torch.Tensor(self.env.action_space.shape).to(self.device)).item()
-            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-            self.alpha = self.log_alpha.exp()
-            self.alpha_optim = Adam([self.log_alpha], lr=lr)
+        if target_entropy is None:
+            self.target_entropy = -torch.prod(torch.Tensor(self.env.action_space.shape).to(self.device)).item()
         else:
-            self.alpha = torch.tensor(ent_coef).to(self.device)
+            self.target_entropy = torch.prod(torch.Tensor([target_entropy]).to(self.device)).item()
 
-        if per:
-            # replay memory with prioritied experience replay
-            self.memory = PrioritizedMemory(
-                memory_size, self.env.observation_space.shape,
-                self.env.action_space.shape, self.device, gamma, multi_step,
-                alpha=alpha, beta=beta, beta_annealing=beta_annealing)
-        else:
-            # replay memory without prioritied experience replay
-            self.memory = MultiStepMemory(
-                memory_size, self.env.observation_space.shape,
-                self.env.action_space.shape, self.device, gamma, multi_step)
+        self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+        self.alpha = self.log_alpha.exp()
+        self.alpha_optim = Adam([self.log_alpha], lr=learning_rate)
+
+        self.memory = MultiStepMemory(
+            memory_size, self.env.observation_space.shape,
+            self.env.action_space.shape, self.device, gamma, multi_step)
 
         self.train_rewards = RunningMeanStats(log_interval)
-
         self.steps = 0
         self.learning_steps = 0
         self.episodes = 0
-        self.num_steps = num_steps
+        self.max_steps = max_steps
         self.tau = tau
-        self.per = per
         self.batch_size = batch_size
         self.start_steps = start_steps
         self.gamma_n = gamma ** multi_step
-        self.entropy_tuning = entropy_tuning
         self.grad_clip = grad_clip
         self.updates_per_step = updates_per_step
         self.log_interval = log_interval
         self.target_update_interval = target_update_interval
         self.eval_interval = eval_interval
-        #
         self.eval_runs = eval_runs
-        self.huber = huber
         self.multi_step = multi_step
 
     def run(self):
         while True:
             self.train_episode()
-            if self.steps > self.num_steps:
+            if self.steps > self.max_steps:
+                self.env = gym.wrappers.RecordVideo(self.env, 'video', episode_trigger=lambda episode: episode)
+                self.eval_runs = 100
+                self.evaluate()
                 break
 
     def is_update(self):
         return len(self.memory) > self.batch_size and self.steps >= self.start_steps
 
     def act(self, state):
-        if self.start_steps > self.steps:
+        if self.steps < self.start_steps:
             action = self.env.action_space.sample()
         else:
             action = self.explore(state)
@@ -120,14 +109,14 @@ class Agent:
 
     def explore(self, state):
         # act with randomness
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        state = torch.tensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action, _, _ = self.policy.sample(state)
         return action.cpu().numpy().reshape(-1)
 
     def exploit(self, state):
         # act without randomness
-        state = torch.FloatTensor(state[0]).unsqueeze(0).to(self.device)
+        state = torch.tensor(state).unsqueeze(0)
         with torch.no_grad():
             _, _, action = self.policy.sample(state)
         return action.cpu().numpy().reshape(-1)
@@ -140,12 +129,8 @@ class Agent:
         with torch.no_grad():
             next_actions, next_entropies, _ = self.policy.sample(next_states)
             next_q1, next_q2 = self.critic_target(next_states, next_actions)
-            if self.method == "sac":
-                next_q = torch.min(next_q1, next_q2) + self.alpha * next_entropies
-            elif self.method == "duvn":
-                next_q = next_q1 + self.alpha * next_entropies
-            else:
-                raise NotImplementedError()
+            next_q = next_q1 + self.alpha * next_entropies  # discard q2
+        # rescale rewards by num step
         target_q = (rewards / (self.multi_step * 1.0)) + (1.0 - dones) * self.gamma_n * next_q
         return target_q
 
@@ -154,7 +139,7 @@ class Agent:
         episode_reward = 0.
         episode_steps = 0
         done = False
-        state = self.env.reset()
+        state = self.env.reset()[0]
 
         while not done:
             action = self.act(state)
@@ -162,33 +147,23 @@ class Agent:
             self.steps += 1
             episode_steps += 1
             episode_reward += reward
-            if episode_steps >= self.env._max_episode_steps:
+            if episode_steps >= 1000:  # max episode steps
                 masked_done = False
             else:
                 masked_done = done
-
-            if self.per:
-                batch = to_batch(
-                    state, action, reward, next_state, masked_done,
-                    self.device)
-                with torch.no_grad():
-                    curr_q1, curr_q2 = self.calc_current_q(*batch)
-                target_q = self.calc_target_q(*batch)
-                error = (0.5 * torch.abs(curr_q1 - target_q) + 0.5 * torch.abs(curr_q2 - target_q)).item()
-                self.memory.append(state, action, reward, next_state, masked_done, error, episode_done=done)
-            else:
                 self.memory.append(state, action, reward, next_state, masked_done, episode_done=done)
-            if self.is_update():
+
+            if len(self.memory) > self.batch_size and self.steps >= self.start_steps:
                 self.learn()
 
             if self.steps % self.eval_interval == 0:
                 self.evaluate()
-                self.save_models()
             state = next_state
 
+        # We log running mean of training rewards.
         self.train_rewards.append(episode_reward)
 
-        self.train_rewards.append(episode_reward)
+        logger.episodes.append([self.steps, episode_steps, episode_reward])
 
         print(f'episode: {self.episodes:<4}  '
               f'episode steps: {episode_steps:<4}  '
@@ -197,64 +172,38 @@ class Agent:
     def learn(self):
         self.learning_steps += 1
 
+        # critic update
         if (self.learning_steps - 1) % self.critic_update_delay == 0:
             for _ in range(self.updates_per_step):
-                if self.per:
-                    # batch with indices and priority weights
-                    batch, indices, weights = self.memory.sample(self.batch_size)
-                else:
-                    batch = self.memory.sample(self.batch_size)
-                    # set priority weights to 1 when we don't use PER.
-                    weights = 1.
-
-
+                batch = self.memory.sample(self.batch_size)
+                weights = 1.
                 q1_loss, q2_loss, errors, mean_q1, mean_q2 = self.calc_critic_loss(batch, weights)
 
                 update_params(self.q1_optim, self.critic.Q1, q1_loss, self.grad_clip)
                 update_params(self.q2_optim, self.critic.Q2, q2_loss, self.grad_clip)
 
                 if self.learning_steps % self.target_update_interval == 0:
-                    soft_update(self.critic_target, self.critic, self.tau)
+                    for t, s in zip(self.critic_target.parameters(), self.critic.parameters()):
+                        t.data.copy_(t.data * (1.0 - self.tau) + s.data * self.tau)
 
-                if self.per:
-                    # update priority weights
-                    self.memory.update_priority(indices, errors.cpu().numpy())
+        # policy and alpha update
+        batch = self.memory.sample(self.batch_size)
+        weights = 1.
 
-        if self.per:
-            batch, indices, weights = self.memory.sample(self.batch_size)
-        else:
-            batch = self.memory.sample(self.batch_size)
-            weights = 1.
-
-        policy_loss, entropies = self.calc_policy_loss(batch, weights) # added by tH 20210705
+        policy_loss, entropies = self.calc_policy_loss(batch, weights)  # added by tH 20210705
         update_params(self.policy_optim, self.policy, policy_loss, self.grad_clip)
 
-        if self.entropy_tuning:
-            entropy_loss = self.calc_entropy_loss(entropies, weights)
-            update_params(self.alpha_optim, None, entropy_loss)
-            self.alpha = self.log_alpha.exp()
-
-    def calc_critic_4redq_loss(self, batch, weights):
-        states, actions, rewards, next_states, dones = batch
-        curr_qs = self.critic.allQs(states, actions)
-
-        target_q = self.calc_target_q(*batch)
-
-        errors = torch.abs(curr_qs[0].detach() - target_q)
-        mean_q1 = curr_qs[0].detach().mean().item()
-        mean_q2 = curr_qs[1].detach().mean().item()
-
-        losses = []
-        for curr_q in curr_qs:
-            losses.append(torch.mean((curr_q - target_q).pow(2) * weights))
-        return losses, errors, mean_q1, mean_q2
+        entropy_loss = self.calc_entropy_loss(entropies, weights)
+        update_params(self.alpha_optim, None, entropy_loss)
+        self.alpha = self.log_alpha.exp()
 
     def calc_critic_loss(self, batch, weights):
-
         curr_q1, curr_q2 = self.calc_current_q(*batch)
         target_q = self.calc_target_q(*batch)
 
+        # TD errors for updating priority weights
         errors = torch.abs(curr_q1.detach() - target_q)
+        # We log means of Q to monitor training.
         mean_q1 = curr_q1.detach().mean().item()
         mean_q2 = curr_q2.detach().mean().item()
 
@@ -269,13 +218,13 @@ class Agent:
         sampled_action, entropy, _ = self.policy.sample(states)
         # expectations of Q with clipped double Q technique
         q1, q2 = self.critic(states, sampled_action)
-        if self.method == "duvn":
-            q2 = q1 # discard q2
+        q2 = q1  # discard q2
         if self.target_drop_rate > 0.0:
             q = 0.5 * (q1 + q2)
         else:
             q = torch.min(q1, q2)
-
+        # Policy objective is maximization of (Q + alpha * entropy) with
+        # priority weights.
         policy_loss = torch.mean((- q - self.alpha * entropy) * weights)
 
         return policy_loss, entropy
@@ -287,62 +236,26 @@ class Agent:
     def evaluate(self):
         episodes = self.eval_runs
         returns = np.zeros((episodes,), dtype=np.float32)
-
-        sar_buf = [[] for _ in range(episodes) ]
         for i in range(episodes):
-            state = self.env.reset()
+            state = self.env.reset()[0]
             episode_reward = 0.
-            done = False
-            while not done:
+            terminated = False
+            truncated = False
+            while not terminated and not truncated:
                 action = self.exploit(state)
                 next_state, reward, terminated, truncated, info = self.env.step(action)
-                print(next_state)
                 episode_reward += reward
                 state = next_state
-
-                sar_buf[i].append([state, action, reward])
-
             returns[i] = episode_reward
-
+            logger.optimaleps.append([self.steps, episode_reward])
         mean_return = np.mean(returns)
 
-        mc_discounted_return = [deque() for _ in range(episodes) ]
-        for i in range(episodes):
-            for re_tran in reversed(sar_buf[i]):
-                if len(mc_discounted_return[i]) > 0:
-                    mcret = re_tran[2] + self.gamma_n * mc_discounted_return[i][0]
-                else:
-                    mcret = re_tran[2]
-                mc_discounted_return[i].appendleft(mcret)
-        norm_coef = np.mean(list(itertools.chain.from_iterable(mc_discounted_return)))
-        norm_coef = math.fabs(norm_coef) + 0.000001
-        norm_scores = [[] for _ in range(episodes)]
-        for i in range(episodes):
-            states = np.array(sar_buf[i], dtype="object")[:, 0].tolist()
-            actions = np.array(sar_buf[i], dtype="object")[:, 1].tolist()
-            with torch.no_grad():
-                state = torch.FloatTensor(states).to(self.device)
-                action = torch.FloatTensor(actions).to(self.device)
-                q1, q2 = self.critic(state, action)
-                q = 0.5 * (q1 + q2)
-                qs = q.to('cpu').numpy()
-            for j in range(len(sar_buf[i])):
-                score = (qs[j][0] - mc_discounted_return[i][j]) / norm_coef
-                norm_scores[i].append(score)
-        # calculate std
-        flatten_norm_score = list(itertools.chain.from_iterable(norm_scores))
-        mean_norm_score = np.mean(flatten_norm_score)
-        std_norm_score = np.std(flatten_norm_score)
-        print("mean norm score " + str(mean_norm_score))
-        print("std norm score " + str(std_norm_score))
+        print('-' * 60)
+        print(f'Num steps: {self.steps:<5}  '
+              f'reward: {mean_return:<5.1f}')
+        print('-' * 60)
 
-def to_batch(state, action, reward, next_state, done, device):
-    state = torch.FloatTensor(state).unsqueeze(0).to(device)
-    action = torch.FloatTensor([action]).view(1, -1).to(device)
-    reward = torch.FloatTensor([reward]).unsqueeze(0).to(device)
-    next_state = torch.FloatTensor(next_state).unsqueeze(0).to(device)
-    done = torch.FloatTensor([done]).unsqueeze(0).to(device)
-    return state, action, reward, next_state, done
+        logger.optimal.append([self.steps, mean_return])
 
 
 def update_params(optim, network, loss, grad_clip=None, retain_graph=False):
@@ -352,20 +265,6 @@ def update_params(optim, network, loss, grad_clip=None, retain_graph=False):
         for p in network.modules():
             torch.nn.utils.clip_grad_norm_(p.parameters(), grad_clip)
     optim.step()
-
-
-def soft_update(target, source, tau):
-    for t, s in zip(target.parameters(), source.parameters()):
-        t.data.copy_(t.data * (1.0 - tau) + s.data * tau)
-
-
-def hard_update(target, source):
-    target.load_state_dict(source.state_dict())
-
-
-def grad_false(network):
-    for param in network.parameters():
-        param.requires_grad = False
 
 
 class RunningMeanStats:
@@ -380,22 +279,32 @@ class RunningMeanStats:
     def get(self):
         return np.mean(self.stats)
 
+
 class BaseNetwork(nn.Module):
     def save(self, path):
         torch.save(self.state_dict(), path)
+
     def load(self, path):
         self.load_state_dict(torch.load(path))
 
+
 class QNetwork(BaseNetwork):
-    def __init__(self, num_inputs, num_actions, hidden_units=[256, 256],
-                 initializer='xavier', layer_norm=0, drop_rate=0.0):
+    def __init__(self, input_dim, output_dim, hidden_units=[], layer_norm=0, drop_rate=0.0):
         super(QNetwork, self).__init__()
 
+        layer = []
+        units = input_dim + output_dim
 
-        self.Q = self.create_linear_network(
-            num_inputs+num_actions, 1, hidden_units=hidden_units,
-            initializer=initializer)
+        for next_units in hidden_units:
+            layer.append(nn.Linear(units, next_units))
+            layer.append(nn.ReLU())
+            units = next_units
 
+        self.output = layer.append(nn.Linear(units, 1))
+
+        self.Q = nn.Sequential(*layer)
+
+        # override network architecture (dropout and layer normalization).
         new_q_networks = []
         for i, mod in enumerate(self.Q._modules.values()):
             new_q_networks.append(mod)
@@ -411,88 +320,32 @@ class QNetwork(BaseNetwork):
         q = self.Q(x)
         return q
 
-    def create_linear_network(self, input_dim, output_dim, hidden_units=[],
-                              hidden_activation='relu', output_activation=None,
-                              initializer='xavier_uniform'):
-        model = []
-        units = input_dim
-        for next_units in hidden_units:
-            model.append(nn.Linear(units, next_units))
-            model.append(self.str_to_activation[hidden_activation])
-            units = next_units
-
-        model.append(nn.Linear(units, output_dim))
-        if output_activation is not None:
-            model.append(self.str_to_activation[output_activation])
-
-        def initialize_weights(m):
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+    def initialize_weights(self, initializer):
+        def initialize(m):
+            if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+                initializer(m.weight)
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    torch.nn.init.constant_(m.bias, 0)
 
-        nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2))
-        return nn.Sequential(nn.Linear(2, 2), nn.Linear(2, 2)).apply(initialize_weights)
+        return initialize
+
 
 class TwinnedQNetwork(BaseNetwork):
 
-    def __init__(self, num_inputs, num_actions, hidden_units=[256, 256],
+    def __init__(self, input_dim, output_dim, hidden_units=[],
                  initializer='xavier', layer_norm=0, drop_rate=0.0):
         super(TwinnedQNetwork, self).__init__()
 
         self.Q1 = QNetwork(
-            num_inputs, num_actions, hidden_units, initializer, layer_norm=layer_norm, drop_rate=drop_rate)
+            input_dim, output_dim, hidden_units, layer_norm=layer_norm, drop_rate=drop_rate)
         self.Q2 = QNetwork(
-            num_inputs, num_actions, hidden_units, initializer, layer_norm=layer_norm, drop_rate=drop_rate)
+            input_dim, output_dim, hidden_units, layer_norm=layer_norm, drop_rate=drop_rate)
 
     def forward(self, states, actions):
         x = torch.cat([states, actions], dim=1)
         q1 = self.Q1(x)
         q2 = self.Q2(x)
         return q1, q2
-
-
-class RandomizedEnsembleNetwork(BaseNetwork):
-
-    def __init__(self, num_inputs, num_actions, hidden_units=[256, 256],
-                 initializer='xavier', layer_norm=0, drop_rate=0.0, N=10):
-        super(RandomizedEnsembleNetwork, self).__init__()
-
-        self.N = N
-        self.indices = list(range(N))
-        for i in range(N):
-            setattr(self, "Q"+str(i),
-                    QNetwork(num_inputs, num_actions, hidden_units, initializer,
-                             layer_norm=layer_norm, drop_rate=drop_rate))
-
-    def forward(self, states, actions):
-        x = torch.cat([states, actions], dim=1)
-
-        random.shuffle(self.indices)
-        q1 = getattr(self, "Q" + str(self.indices[0]))(x)
-        q2 = getattr(self, "Q" + str(self.indices[1]))(x)
-
-        return q1, q2
-
-    def allQs(self, states, actions):
-        x = torch.cat([states, actions], dim=1)
-
-        Qs = []
-        for i in range(self.N):
-            Qs.append(getattr(self, "Q" + str(i))(x))
-        return Qs
-
-    def averageQ(self, states, actions):
-        x = torch.cat([states, actions], dim=1)
-
-        q = getattr(self, "Q" + str(0))(x)
-        for i in range(1, self.N):
-            q = q + getattr(self, "Q" + str(i))(x)
-        q = q / self.N
-
-        return q
-
-
 
 
 class MultiStepBuff:
@@ -504,7 +357,7 @@ class MultiStepBuff:
         self.memory = {
             key: deque(maxlen=self.maxlen)
             for key in self.keys
-            }
+        }
 
     def append(self, state, action, reward):
         self.memory["state"].append(state)
@@ -554,7 +407,7 @@ class Memory:
         self._append(state, action, reward, next_state, done)
 
     def _append(self, state, action, reward, next_state, done):
-        state = np.array(state[0], dtype=self.state_type)
+        state = np.array(state, dtype=self.state_type)
         next_state = np.array(next_state, dtype=self.state_type)
 
         self.states[self._p] = state
@@ -619,10 +472,10 @@ class Memory:
 
         if self._p + num_data <= self.capacity:
             self._insert(
-                slice(self._p, self._p+num_data), batch,
+                slice(self._p, self._p + num_data), batch,
                 slice(0, num_data))
         else:
-            mid_index = self.capacity-self._p
+            mid_index = self.capacity - self._p
             end_index = num_data - mid_index
             self._insert(
                 slice(self._p, self.capacity), batch,
@@ -641,6 +494,7 @@ class Memory:
         self.rewards[mem_indices] = rewards[batch_indices]
         self.next_states[mem_indices] = next_states[batch_indices]
         self.dones[mem_indices] = dones[batch_indices]
+
 
 class MultiStepMemory(Memory):
 
@@ -669,140 +523,88 @@ class MultiStepMemory(Memory):
             self._append(state, action, reward, next_state, done)
 
 
-
-class GaussianPolicy(BaseNetwork):
+# actor network using gaussian distribution
+class Actor(BaseNetwork):
     LOG_STD_MAX = 2
     LOG_STD_MIN = -20
     eps = 1e-6
 
-    def __init__(self, num_inputs, num_actions, hidden_units=[256, 256],
-                 initializer='xavier', layer_norm=0, drop_rate=0.0):
-        super(GaussianPolicy, self).__init__()
+    def __init__(self, input_dim, output_dim, hidden_units=[]):
+        super(Actor, self).__init__()
 
-        self.policy = self.create_linear_network(
-            num_inputs, num_actions*2, hidden_units=hidden_units,
-            initializer=initializer)
+        model = []
+        units = input_dim
 
+        for next_units in hidden_units:
+            model.append(nn.Linear(units, next_units))
+            model.append(nn.ReLU())
+            units = next_units
 
-        # override network architecture (dropout and layer normalization). TH 20210731
-        """new_q_networks = []
-        for i, mod in enumerate(self.Q._modules.values()):
-            new_q_networks.append(mod)
-            if ((i % 2) == 0) and (i < (len(list(self.Q._modules.values()))) - 1):
-                if drop_rate > 0.0:
-                    new_q_networks.append(nn.Dropout(p=drop_rate))  # dropout
-                if layer_norm:
-                    new_q_networks.append(nn.LayerNorm(mod.out_features))  # layer norm
-            i += 1
-        self.Q = nn.Sequential(*new_q_networks)
-        """
+        self.output = model.append(nn.Linear(units, output_dim * 2))
+
+        self.network = nn.Sequential(*model).apply(
+            self.initialize_weights(nn.init.xavier_uniform_))
+
     def forward(self, states):
-        mean = states[0].mean()
-        log_std = states[0].std().log()
+        mean, log_std = torch.chunk(self.network(states), 2, dim=-1)
         log_std = torch.clamp(
             log_std, min=self.LOG_STD_MIN, max=self.LOG_STD_MAX)
 
         return mean, log_std
 
     def sample(self, states):
+        # calculate Gaussian distribusion of (mean, std)
         means, log_stds = self.forward(states)
         stds = log_stds.exp()
         normals = Normal(means, stds)
+        # sample actions
         xs = normals.rsample()
         actions = torch.tanh(xs)
-        log_probs = normals.log_prob(xs)\
-            - torch.log(1 - actions.pow(2) + self.eps)
-        print(log_probs)
+        # calculate entropies
+        log_probs = normals.log_prob(xs) \
+                    - torch.log(1 - actions.pow(2) + self.eps)
         entropies = -log_probs.sum()
-
         return actions, entropies, torch.tanh(means)
 
+    def initialize_weights(self, initializer):
+        def initialize(m):
+            if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+                initializer(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0)
 
-    def create_linear_network(self, input_dim, output_dim, hidden_units=[],
-                              hidden_activation='relu', output_activation=None,
-                              initializer='xavier_uniform'):
-
-        conv_layer = nn.Conv2d(input_dim, output_dim, kernel_size=1)
-        nn.init.xavier_uniform_(conv_layer.weight, gain=1)
-        nn.init.constant_(conv_layer.bias, 0)
-        return conv_layer
-
-
-class PrioritizedMemory(MultiStepMemory):
-
-    def __init__(self, capacity, state_shape, action_shape, device,
-                 gamma=0.99, multi_step=3, alpha=0.6, beta=0.4,
-                 beta_annealing=0.001, epsilon=1e-4):
-        super(PrioritizedMemory, self).__init__(
-            capacity, state_shape, action_shape, device, gamma, multi_step)
-        self.alpha = alpha
-        self.beta = beta
-        self.beta_annealing = beta_annealing
-        self.epsilon = epsilon
-
-    def append(self, state, action, reward, next_state, done, error,
-               episode_done=False):
-        if self.multi_step != 1:
-            self.buff.append(state, action, reward)
-
-            if len(self.buff) == self.multi_step:
-                state, action, reward = self.buff.get(self.gamma)
-                self.priorities[self._p] = self.calc_priority(error)
-                self._append(state, action, reward, next_state, done)
-
-            if episode_done or done:
-                self.buff.reset()
-        else:
-            self.priorities[self._p] = self.calc_priority(error)
-            self._append(state, action, reward, next_state, done)
-
-    def update_priority(self, indices, errors):
-        self.priorities[indices] = np.reshape(
-            self.calc_priority(errors), (-1, 1))
-
-    def calc_priority(self, error):
-        return (np.abs(error) + self.epsilon) ** self.alpha
-
-    def sample(self, batch_size):
-        self.beta = min(1. - self.epsilon, self.beta + self.beta_annealing)
-        sampler = WeightedRandomSampler(
-            self.priorities[:self._n, 0], batch_size)
-        indices = list(sampler)
-        batch = self._sample(indices)
-
-        p = self.priorities[indices] / np.sum(self.priorities[:self._n])
-        weights = (self._n * p) ** -self.beta
-        weights /= np.max(weights)
-        weights = torch.FloatTensor(weights).to(self.device)
-
-        return batch, indices, weights
-
-    def reset(self):
-        super(PrioritizedMemory, self).reset()
-        self.priorities = np.empty(
-            (self.capacity, 1), dtype=np.float32)
-
-    def get(self):
-        valid = slice(0, self._n)
-        return (
-            self.states[valid], self.actions[valid], self.rewards[valid],
-            self.next_states[valid], self.dones[valid], self.priorities[valid])
-
-    def _insert(self, mem_indices, batch, batch_indices):
-        states, actions, rewards, next_states, dones, priorities = batch
-        self.states[mem_indices] = states[batch_indices]
-        self.actions[mem_indices] = actions[batch_indices]
-        self.rewards[mem_indices] = rewards[batch_indices]
-        self.next_states[mem_indices] = next_states[batch_indices]
-        self.dones[mem_indices] = dones[batch_indices]
-        self.priorities[mem_indices] = priorities[batch_indices]
+        return initialize
 
 
-env = gym.make("LunarLander-v2", continuous= True, render_mode="human")
-n_games = 100
-best_score = float('-inf')
-episode_score_history = []
-state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.shape[0]
+class Logger:
+    episodes = []
+    optimal = []
+    optimaleps = []
+
+    def __init__(self):
+        self.episodes.append(["t", "length", "reward"])
+        self.optimal.append(["t", "avg"])
+        self.optimaleps.append(["t", "reward"])
+
+    def export(self, agent):
+        name = "tests\\" + str(int(time.time()))
+        with open(name + "_eps.csv", "a+") as file:
+            for ep in self.episodes:
+                file.write(",".join([str(x) for x in ep]) + "\n")
+        with open(name + "_optim.csv", "a+") as file:
+            for data in self.optimal:
+                file.write(",".join([str(x) for x in data]) + "\n")
+        with open(name + "_optim_eps.csv", "a+") as file:
+            for data in self.optimaleps:
+                file.write(",".join([str(x) for x in data]) + "\n")
+
+
+env = gym.make("LunarLander-v2", continuous=True, render_mode="rgb_array")
+
 agent = Agent(env)
+logger = Logger()
 agent.run()
+logger.export(agent)
+env.close()
+
+env.close()
