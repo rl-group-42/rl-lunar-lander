@@ -136,7 +136,7 @@ class ActorNet(nn.Module):
     def forward(self, state):
         output = self.network(state)
         mean = self.mean_layer(output)
-        
+
         logstd = torch.clamp(self.logstd_layer(output), -3, 2)
 
         return mean, logstd
@@ -204,7 +204,7 @@ class SACAgent:
         self.l_rate = l_rate
         self.hidden = hidden
 
-        self.batch_size = 256
+        self.batch_size = 128
 
         self.actor = ActorNet(input_dim, output_dim, l_rate=l_rate, hidden_dims=hidden).to(self.device)
         self.critic1 = CriticNet(input_dim + output_dim, l_rate=l_rate, hidden_dims=hidden).to(self.device)
