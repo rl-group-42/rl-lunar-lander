@@ -43,3 +43,7 @@ score2@episode2:step_count2
 ...
 scoreN@episodeN:step_countN
 ```
+
+train() returns trained agent as DQNAgent object
+
+visual_run_agent(agent) can be called to run the agent visually by passing a DQNAgent object
