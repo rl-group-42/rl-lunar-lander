@@ -1,5 +1,5 @@
 # DQN
-Implementation of the DQN algorithm with Duelling Networks, Double Q-Learning, and Prioritised Experience Replay
+Implementation of the DQN algorithm with Duelling Networks, Double Q-Learning, and Prioritised Experience Replay on the LunarLander environment
 
 To train the network, call train(params, modifications=[], save_data=False) with
 
