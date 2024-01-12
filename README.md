@@ -3,7 +3,7 @@
 ## PPO 
 Implementation of the PPO algorithm for the LunarLander environment (ppo_code_2.py)
 
-The train the network, create an Agent object with the below parameters (provided values are the default):
+To train the network, create an Agent object with the below parameters (provided values are the default):
 ```py
 
 training_iterations = 10000
@@ -55,7 +55,7 @@ NB. It is possible to train the network on continuous or discrete action space b
 ## RND-PPO
 Implementation of the RND-PPO algorithm for the LunarLander environment (rnd_code_4.py)
 
-The train the network, create an Agent object with the below parameters (provided values are the default):
+To train the network, create an Agent object with the below parameters (provided values are the default):
 ```py
 training_iterations = 10000
 rnd_iterations = 5
