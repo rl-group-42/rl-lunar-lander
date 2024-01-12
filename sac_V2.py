@@ -136,8 +136,7 @@ class ActorNet(nn.Module):
     def forward(self, state):
         output = self.network(state)
         mean = self.mean_layer(output)
-
-        # maybe experiment with clamp values
+        
         logstd = torch.clamp(self.logstd_layer(output), -3, 2)
 
         return mean, logstd
@@ -191,7 +190,7 @@ class SACAgent:
         self.actorloss = []
 
         self.title = "saves\\Updates=4"
-        # new stuff vv
+        # Hyperparameters
         self.entropystart = 0.3 # alpha 0.3
         self.entropy = self.entropystart
         self.entropyzero = 0.9 # 0.9, 90% way through training
@@ -218,8 +217,6 @@ class SACAgent:
             target.data.copy_(live.data)
         for target, live in zip(self.critic2.parameters(), self.critic2tar.parameters()):
             target.data.copy_(live.data)
-
-        # maybe some stuff here about optimizing alpha??
             
         print(self.info())
 
@@ -262,6 +259,7 @@ class SACAgent:
         # output += ", truncated: " + str(sum(ends[bindex:])) + "%  "
         print("\r" + output, end="")
 
+    # runs an optimal episode
     def run_ep(self, t):
 
         terminal = False
@@ -275,6 +273,7 @@ class SACAgent:
         logger.optimaleps.append([t, epreward])
         return epreward
     
+    # runs a batch of optimal episodes and returns the average
     def runs_avg(self, runs, t):
         rewards = []
         for _ in range(runs):
@@ -310,7 +309,6 @@ class SACAgent:
                 print("real score: " + str(int(self.runs_avg(100, t))))
             if terminal:
                 self.save()
-                # current_state = self.env.reset(seed=1)[0]
                 current_state = self.env.reset()[0]
 
                 reward_hist.append(total_reward)
@@ -321,10 +319,8 @@ class SACAgent:
                 # logging
                 logger.episodes.append([t, t-ep_start, total_reward])
                 
-
                 total_reward = 0
                 ep_start = t
-
             
             if t < exploration:
                 action = self.env.action_space.sample()
@@ -365,9 +361,9 @@ class SACAgent:
         next_q1 = self.critic1tar.forward(next_act, nexts)
         next_q2 = self.critic2tar.forward(next_act, nexts)
         next_q = torch.min(next_q1, next_q2) - self.entropy * next_log_prob
-        # not sure if i need to detach, not done in other places
         tar_q = rewards + (1-dones) * self.discount * next_q.detach()
 
+        # calculating critic 1 loss
         curr_q1 = self.critic1.forward(actions, states)
         crit_loss1 = torch.nn.functional.mse_loss(curr_q1, tar_q)
         self.crit1loss.append(self.get_numpy(crit_loss1))
@@ -375,6 +371,7 @@ class SACAgent:
         crit_loss1.backward()
         self.critic1.optimizer.step()
         
+        # calculating critic 2 loss
         curr_q2 = self.critic2.forward(actions, states)
         crit_loss2 = torch.nn.functional.mse_loss(curr_q2, tar_q)
         self.crit2loss.append(self.get_numpy(crit_loss2))
@@ -382,6 +379,7 @@ class SACAgent:
         crit_loss2.backward()
         self.critic2.optimizer.step()
 
+        # calculating actor loss
         sample_act, sample_log_prob = self.actor.sample_normal(states)
         act_q1 = self.critic1.forward(sample_act, states)
         act_q2 = self.critic2.forward(sample_act, states)
@@ -395,89 +393,24 @@ class SACAgent:
 
         self.polyak_update()
 
-        # maybe some stuff about optimizing alpha
-
-
     def polyak_update(self):
         for target, real in zip(self.critic1tar.parameters(), self.critic1.parameters()):
             target.data.copy_((self.polyak * target.data) + ((1-self.polyak) * real.data))
         for target, real in zip(self.critic2tar.parameters(), self.critic2.parameters()):
             target.data.copy_((self.polyak * target.data) + ((1-self.polyak) * real.data))
 
-    
-    # env: gym.Env, batch_size, discount, start_training, polyak, entropy
 def main():
-    env = gym.make("LunarLander-v2", 
-         continuous=True)
+    env = gym.make("LunarLander-v2", continuous=True)
     print("using " + get_device())
-    # torch.autograd.set_detect_anomaly(True)
-    # print(env.action_space)
-    # print(env.action_space.shape)
-    # print(env.observation_space)
-    # print(env.observation_space.shape[0])
-    # print(env.reset()[0])
-    # print(type(env.reset()[0]))
-    agent = SACAgent(env)
-    rewards = agent.train(1200, maxsteps=20000000, exploration=4000)
-    logger.export(agent)
-    # print("final avg score: " + str(agent.runs_avg(100)))
-    # exit()
-    i = 0
-    batch = 100
-    # print(len(logger.actions))
-    # print(logger.actions[0])
-    # logger.actions = np.array(logger.actions)
-    act_mean = []
-    act_std = []
-    while i + batch < len(logger.actions):
-        arr = np.array(logger.actions[i:i+batch])
-        # arr.mean()
-        # print(arr.mean())
-        # print(arr.std())
-        # print(arr.mean(axis=0))
-        # print(arr.std(axis=0))
-        act_mean.append(arr.mean(axis=0))
-        act_std.append(arr.std(axis=0))
-        i += batch
-    
-    print()
-    print(len(rewards))
-    # plt.subplot(1, 2, 1)
-    # plt.title("Episode Rewards")
-    # plt.plot(rewards)
-    # plt.title("Gradient Norms")
-    # plt.plot(valgrads, label="Value")
-    # plt.plot(crit1grads, label="Critic 1")
-    # plt.plot(crit2grads, label="Critic 2")
-    # plt.plot(actgrads, label="Actor")
-    plt.subplot(1, 2, 1)
-    plt.title("Actions")
-    m = np.array([x[0] for x in act_mean])
-    d = np.array([x[0] for x in act_std])
-    plt.plot(m, label="Action 0 Mean")
-    plt.fill_between(range(len(m)), m-d, m+d, label="Action 0 Std Dev", alpha=0.5)
-    m = np.array([x[1] for x in act_mean])
-    d = np.array([x[1] for x in act_std])
-    plt.plot(m, label="Action 1 Mean")
-    plt.fill_between(range(len(m)), m-d, m+d, label="Action 1 Std Dev", alpha=0.5)
-    # plt.plot([x[0] for x in act_std], label="Action 0 Std Dev", color="blue")
-    # plt.plot([x[1] for x in act_mean], label="Action 1 Mean", color="orange")
-    # plt.plot([x[1] for x in act_std], label="Action 1 Std Dev", color="red")
-    # plt.plot(, label="")
-    # plt.plot(, label="")
-    # plt.plot(, label="")
-    # plt.plot(, label="")
-    plt.subplot(1, 2, 2)
-    plt.title("Loss")
-    # plt.plot(agent.valloss, label="Value")
-    plt.plot(agent.crit1loss, label="Critic 1")
-    plt.plot(agent.crit2loss, label="Critic 2")
-    plt.plot(agent.actorloss, label="Actor")
-    plt.legend()
-    # plt.show()
-    # print(len(agent.memory.buffer))
-    # print(agent.get_action(env.reset()[0]))
 
+    agent = SACAgent(env)
+    rewards = agent.train(1200)
+    logger.export(agent)
+
+    plt.title("Episode Rewards")
+    plt.plot(rewards)
+    plt.show()
+    
 logger = Logger()
 
 def visualrun(file):
@@ -499,15 +432,5 @@ def visualrun(file):
     env.close()
     return epreward
 
-
 if __name__ == "__main__":
     main() 
-    # print(get_device())
-    # # Check if CUDA is available
-    # print(torch.cuda.is_available())
-
-    # # Get the number of GPUs available
-    # print(torch.cuda.device_count())
-
-    # # Get the name of the current GPU
-    # print(torch.cuda.get_device_name(0))  # Change the number if you have multiple GPUs
