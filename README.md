@@ -53,7 +53,7 @@ env = gym.make("LunarLander-v2", continuous=continuity)
 NB. It is possible to train the network on continuous or discrete action space by toggling the continuity boolean. 
 
 ## RND-PPO
-Implementation of the RND algorithm for the LunarLander environment (rnd_code_4.py)
+Implementation of the RND-PPO algorithm for the LunarLander environment (rnd_code_4.py)
 
 The train the network, create an Agent object with the below parameters (provided values are the default):
 ```py
