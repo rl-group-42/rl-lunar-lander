@@ -50,13 +50,15 @@ class Logger:
             for data in self.optimaleps:
                 file.write(",".join([str(x) for x in data]) + "\n")
         with open(name + "_info.txt", "w") as file:
-            file.write(f"entropy Start (alpha): {agent.entropy}\n")
-            file.write(f"entropy zero(alpha): {agent.entropy}\n")
+            file.write(f"entropy Start (alpha): {agent.entropystart}\n")
+            file.write(f"entropy zero(alpha): {agent.entropyzero}\n")
             file.write(f"discount (gamma): {agent.discount}\n")
             file.write(f"polyak (1-tau): {agent.polyak}\n")
             file.write(f"learning rate: {agent.l_rate}\n")
             file.write(f"network structure: {agent.hidden}\n")
             file.write(f"minibatch size: {agent.batch_size}\n")
+            file.write(f"updates per step: {agent.updates}\n")
+    
 
 
 
@@ -188,21 +190,22 @@ class SACAgent:
         self.crit2loss = []
         self.actorloss = []
 
-
+        self.title = "saves\\Updates=4"
         # new stuff vv
-        self.entropystart = 0.3 # alpha 0.2 start
+        self.entropystart = 0.3 # alpha 0.3
         self.entropy = self.entropystart
-        self.entropyzero = 0.9
-        self.discount = 0.99 # gamma
-        self.polyak = 0.99 # 1 - tau
-        l_rate = 0.0003
-        hidden = [512, 512]
+        self.entropyzero = 0.9 # 0.9, 90% way through training
+        self.discount = 0.99 # gamma 0.99
+        self.polyak = 0.99 # 1 - tau 0.99
+        l_rate = 0.0003 # 0.0003
+        hidden = [512, 512] # 512, 512
+        self.updates = 1 # 2
 
         # for logging
         self.l_rate = l_rate
         self.hidden = hidden
 
-        self.batch_size = 128
+        self.batch_size = 256
 
         self.actor = ActorNet(input_dim, output_dim, l_rate=l_rate, hidden_dims=hidden).to(self.device)
         self.critic1 = CriticNet(input_dim + output_dim, l_rate=l_rate, hidden_dims=hidden).to(self.device)
@@ -217,6 +220,20 @@ class SACAgent:
             target.data.copy_(live.data)
 
         # maybe some stuff here about optimizing alpha??
+            
+        print(self.info())
+
+    def info(self):
+        output = ""
+        output += (f"entropy Start (alpha): {self.entropystart}\n")
+        output += (f"entropy zero(alpha): {self.entropyzero}\n")
+        output += (f"discount (gamma): {self.discount}\n")
+        output += (f"polyak (1-tau): {self.polyak}\n")
+        output += (f"learning rate: {self.l_rate}\n")
+        output += (f"network structure: {self.hidden}\n")
+        output += (f"minibatch size: {self.batch_size}\n")
+        output += (f"updates per step: {self.updates}\n")
+        return output
 
     def get_tensor (self, array):
         return torch.from_numpy(array).float().to(self.device)
@@ -265,6 +282,18 @@ class SACAgent:
         avg = sum(rewards)/runs
         logger.optimal.append([t, avg])
         return avg
+    
+    def save(self):
+        torch.save(self.actor.state_dict(), f"{self.title}_actor.pt")
+        torch.save(self.critic1.state_dict(), f"{self.title}_crit1.pt")
+        torch.save(self.critic2.state_dict(), f"{self.title}_crit2.pt")
+
+    def load(self):
+        self.actor.load_state_dict(torch.load(f"{self.title}_actor.pt"))
+        self.critic1.load_state_dict(torch.load(f"{self.title}_crit1.pt"))
+        self.critic1tar.load_state_dict(torch.load(f"{self.title}_crit1.pt"))
+        self.critic2.load_state_dict(torch.load(f"{self.title}_crit2.pt"))
+        self.critic2tar.load_state_dict(torch.load(f"{self.title}_crit2.pt"))
 
     def train(self, episodes, maxsteps=200000, exploration=4000):
         reward_hist = []
@@ -280,6 +309,7 @@ class SACAgent:
             if t % 4000 == 0:
                 print("real score: " + str(int(self.runs_avg(100, t))))
             if terminal:
+                self.save()
                 # current_state = self.env.reset(seed=1)[0]
                 current_state = self.env.reset()[0]
 
@@ -308,10 +338,9 @@ class SACAgent:
             current_state = next_state
             if self.entropyzero > 0: self.entropy = max(0, self.entropystart * (1 - (len(lens)/episodes) / self.entropyzero))
             if t == exploration: 
-                for _ in range(100): self.train_networks()
+                for _ in range(int(exploration/2)): self.train_networks()
             if t > exploration:
-                self.train_networks()
-                self.train_networks()
+                for _ in range(self.updates): self.train_networks()
         print()
         return reward_hist
 
@@ -445,11 +474,31 @@ def main():
     plt.plot(agent.crit2loss, label="Critic 2")
     plt.plot(agent.actorloss, label="Actor")
     plt.legend()
-    plt.show()
+    # plt.show()
     # print(len(agent.memory.buffer))
     # print(agent.get_action(env.reset()[0]))
 
 logger = Logger()
+
+def visualrun(file):
+    env = gym.make("LunarLander-v2", 
+        continuous=True, render_mode="rgb_array")
+    agent = SACAgent(env)
+    env = gym.wrappers.RecordVideo(env, "vids")
+    agent.actor.load_state_dict(torch.load(file))
+
+    terminal = False
+    state = env.reset()[0]
+    epreward = 0
+    while not terminal:
+        action, _ = agent.actor.forward(agent.get_tensor(state))
+        state, reward, isterminal, truncated, _ = agent.env.step(agent.get_numpy(action))
+        terminal = isterminal or truncated
+        epreward += reward
+
+    env.close()
+    return epreward
+
 
 if __name__ == "__main__":
     main() 
